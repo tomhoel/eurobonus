@@ -1,0 +1,21 @@
+[Unit]
+Description=SAS EuroBonus Award Monitor
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tomhoel
+WorkingDirectory=/Users/tomhoel/Documents/eurobonus
+ExecStart=/usr/bin/python3 /Users/tomhoel/Documents/eurobonus/sas_monitor.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/Users/tomhoel/Documents/eurobonus/monitor.log
+StandardError=append:/Users/tomhoel/Documents/eurobonus/monitor.log
+
+# Security settings (optional but recommended)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
