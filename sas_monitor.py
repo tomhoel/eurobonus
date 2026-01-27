@@ -528,61 +528,64 @@ class SASAwardMonitor:
 
                 for cabin in cabin_classes:
                     seats = avail.get(cabin, 0)
-                    if seats > 0:
-                        if self.baseline_mode:
-                            # Baseline mode: store without notification
+                    
+                    if self.baseline_mode:
+                        # Baseline mode: store without notification (only if seats > 0)
+                        if seats > 0:
                             self.db.store_baseline(origin, destination, date, cabin, seats)
                             alerts += 1
-                        else:
-                            # Normal mode: check if new or increased
-                            prev = self.db.get_previous_availability(
-                                origin, destination, date, cabin
-                            )
+                    else:
+                        # Normal mode: check if new or increased
+                        prev = self.db.get_previous_availability(
+                            origin, destination, date, cabin
+                        )
 
-                            # Check if this was in baseline
-                            is_baseline = self.db.is_baseline_ticket(
-                                origin, destination, date, cabin
-                            )
+                        # Check if this was in baseline
+                        is_baseline = self.db.is_baseline_ticket(
+                            origin, destination, date, cabin
+                        )
 
-                            # Alert only on truly new or increased availability
-                            should_alert = False
-                            is_vanishing = False
+                        # Alert only on truly new or increased availability
+                        should_alert = False
+                        is_vanishing = False
+                        
+                        if seats > 0:
                             if prev is None and not is_baseline:
                                 # Truly new ticket (not in baseline)
                                 should_alert = True
                             elif prev is not None and seats > prev:
                                 # Seat increase
                                 should_alert = True
-                            elif prev is not None and seats < prev and seats == 0:
-                                # Seat disappearance (only notify when fully gone)
-                                is_vanishing = True
+                        elif prev is not None and prev > 0 and seats == 0:
+                            # Seat disappearance (only notify when fully gone)
+                            is_vanishing = True
 
-                            if should_alert:
-                                discovered_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-                                msg = self.notifier.format_availability_alert(
-                                    origin, destination, date, cabin,
-                                    seats, prev, city_name,
-                                    direction=direction,
-                                    discovered_at=discovered_at
-                                )
-                                if self.notifier.send_message(msg):
-                                    self.db.log_notification(
-                                        origin, destination, date, cabin, seats, msg
-                                    )
-                                alerts += 1
-                            elif is_vanishing:
-                                # Notify on vanishing seats
-                                msg = self.notifier.format_vanishing_alert(
-                                    origin, destination, date, cabin,
-                                    prev, city_name, direction=direction
-                                )
-                                self.notifier.send_message(msg)
-                                alerts += 1
-
-                            # Always store current state
-                            self.db.store_availability(
-                                origin, destination, date, cabin, seats
+                        if should_alert:
+                            discovered_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                            msg = self.notifier.format_availability_alert(
+                                origin, destination, date, cabin,
+                                seats, prev, city_name,
+                                direction=direction,
+                                discovered_at=discovered_at
                             )
+                            if self.notifier.send_message(msg):
+                                self.db.log_notification(
+                                    origin, destination, date, cabin, seats, msg
+                                )
+                            alerts += 1
+                        elif is_vanishing:
+                            # Notify on vanishing seats
+                            msg = self.notifier.format_vanishing_alert(
+                                origin, destination, date, cabin,
+                                prev, city_name, direction=direction
+                            )
+                            self.notifier.send_message(msg)
+                            alerts += 1
+
+                        # Always store current state (even when seats = 0)
+                        self.db.store_availability(
+                            origin, destination, date, cabin, seats
+                        )
 
         return alerts
     
