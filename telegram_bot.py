@@ -597,6 +597,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 <b>📅 Other:</b>
 /calendar OSL BKK - Emoji calendar view
 /history OSL BKK - Release history
+/alerts - View notification history
 /status - System health
 
 <b>Supported Routes:</b>
@@ -1317,6 +1318,116 @@ def build_catalogue_page(tickets: list, page: int = 0, sort_by: str = "recent", 
     return message.strip(), keyboard
 
 
+def build_alerts_page(notifications: list, page: int = 0,
+                     filter_type: str = "all") -> tuple:
+    """
+    Build a paginated alerts history page.
+
+    Args:
+        notifications: List of notification tuples from DB
+        page: Current page number (0-indexed)
+        filter_type: Filter applied ('all', 'new', 'vanished', etc.)
+
+    Returns:
+        (message_text, keyboard_buttons)
+    """
+    from datetime import datetime
+
+    ITEMS_PER_PAGE = 10
+
+    # Calculate pagination
+    total_items = len(notifications)
+    total_pages = max(1, (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+
+    start_idx = page * ITEMS_PER_PAGE
+    end_idx = min(start_idx + ITEMS_PER_PAGE, total_items)
+    page_items = notifications[start_idx:end_idx]
+
+    # Build header
+    filter_names = {
+        "all": "All Notifications",
+        "new": "New Tickets",
+        "vanished": "Vanished Tickets",
+        "increase": "Seat Increases",
+        "decrease": "Seat Decreases"
+    }
+
+    message = f"📨 <b>Notification History</b>\n"
+    message += f"Filter: {filter_names.get(filter_type, 'All')}\n"
+    message += f"Page {page + 1}/{total_pages} ({total_items} total)\n\n"
+
+    if not page_items:
+        message += "No notifications found."
+        return message, []
+
+    # Build notification list
+    for i, notif in enumerate(page_items, start=start_idx + 1):
+        notif_id, sent_at, origin, destination, date, cabin, seats, msg_preview = notif
+
+        # Parse timestamp
+        try:
+            dt = datetime.strptime(sent_at, "%Y-%m-%d %H:%M:%S")
+            time_str = dt.strftime("%b %d, %H:%M")
+        except:
+            time_str = sent_at
+
+        # Detect notification type from message
+        if "NEW TICKETS" in msg_preview:
+            emoji = "🎉"
+            notif_type = "New"
+        elif "TICKETS GONE" in msg_preview:
+            emoji = "💨"
+            notif_type = "Gone"
+        elif "SEATS BEING BOOKED" in msg_preview:
+            emoji = "📉"
+            notif_type = "Decrease"
+        else:
+            emoji = "📨"
+            notif_type = "Alert"
+
+        # Format route if available
+        route_str = f"{origin}→{destination}" if origin and destination else "Multiple routes"
+
+        message += f"{emoji} <b>{time_str}</b>\n"
+        message += f"   {notif_type}: {route_str}"
+        if date:
+            message += f" ({date})"
+        if cabin:
+            cabin_name = {"AG": "Economy", "AP": "Premium", "AB": "Business"}.get(cabin, cabin)
+            message += f" - {cabin_name}"
+        message += "\n\n"
+
+    # Build keyboard
+    keyboard = []
+
+    # Filter buttons row
+    filter_row = []
+    for f_type, f_name in [("all", "All"), ("new", "New"), ("vanished", "Gone"),
+                           ("increase", "Incr"), ("decrease", "Decr")]:
+        checkmark = "✓ " if f_type == filter_type else ""
+        filter_row.append(InlineKeyboardButton(
+            f"{checkmark}{f_name}",
+            callback_data=f"alerts:{page}:{f_type}"
+        ))
+    keyboard.append(filter_row)
+
+    # Navigation row
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("< Prev", callback_data=f"alerts:{page-1}:{filter_type}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Next >", callback_data=f"alerts:{page+1}:{filter_type}"))
+
+    if nav_row:
+        keyboard.append(nav_row)
+
+    # Close button
+    keyboard.append([InlineKeyboardButton("❌ Close", callback_data="close")])
+
+    return message, keyboard
+
+
 async def tickets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handle /tickets command - show all tracked tickets with historical max.
@@ -1503,6 +1614,41 @@ async def calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message, parse_mode=ParseMode.HTML)
 
 
+async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handle /alerts command - view notification history with pagination.
+    """
+    db_path = context.bot_data.get("db_path", "sas_monitor.db")
+
+    from sas_monitor import AvailabilityDatabase
+    adb = AvailabilityDatabase(db_path)
+
+    try:
+        # Get all notifications (will paginate in UI)
+        notifications = adb.get_notification_history(limit=100, offset=0, filter_type="all")
+
+        if not notifications:
+            await update.message.reply_text(
+                "📨 No notifications found.\n\n"
+                "Notifications will appear here after the monitor detects changes "
+                "and sends alerts.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        # Build first page
+        message, keyboard = build_alerts_page(notifications, page=0, filter_type="all")
+
+        await update.message.reply_text(
+            message,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    finally:
+        adb.close()
+
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /status command - show system health dashboard."""
     db_path = context.bot_data.get("db_path", "sas_monitor.db")
@@ -1569,6 +1715,32 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     message,
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            finally:
+                adb.close()
+
+        elif action == "alerts" and len(parts) == 3:
+            # alerts:page:filter
+            page = int(parts[1])
+            filter_type = parts[2]
+
+            db_path = context.bot_data.get("db_path", "sas_monitor.db")
+            from sas_monitor import AvailabilityDatabase
+            adb = AvailabilityDatabase(db_path)
+
+            try:
+                # Get notifications with filter
+                notifications = adb.get_notification_history(
+                    limit=100, offset=0, filter_type=filter_type
+                )
+
+                # Rebuild page
+                message, keyboard = build_alerts_page(notifications, page, filter_type)
+
+                await query.edit_message_text(
+                    message,
+                    parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
             finally:
@@ -1828,7 +2000,8 @@ class SASAwardBot:
         self.application.add_handler(CommandHandler("velocity", velocity_command))
         self.application.add_handler(CommandHandler("stats", stats_command))
         self.application.add_handler(CommandHandler("status", status_command))
-        
+        self.application.add_handler(CommandHandler("alerts", alerts_command))
+
         # Register callback query handler for inline buttons
         self.application.add_handler(CallbackQueryHandler(callback_handler))
 

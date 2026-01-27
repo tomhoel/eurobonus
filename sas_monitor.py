@@ -489,6 +489,63 @@ class AvailabilityDatabase:
 
         self.conn.commit()
 
+    def get_notification_history(self, limit: int = 50, offset: int = 0,
+                                 filter_type: str = "all") -> list:
+        """
+        Get notification history with pagination and filtering.
+
+        Args:
+            limit: Number of results to return (default 50)
+            offset: Starting position (for pagination)
+            filter_type: 'all', 'new', 'vanished', 'increase', 'decrease'
+
+        Returns:
+            List of tuples: (id, sent_at, origin, destination, date,
+                            cabin_class, seats, message_preview)
+        """
+        # Base query
+        query = """
+            SELECT id, sent_at, origin, destination, date,
+                   cabin_class, seats, substr(message, 1, 150) as message_preview
+            FROM notifications
+            WHERE 1=1
+        """
+        params = []
+
+        # Apply filter based on notification type
+        # We detect type from the message content
+        if filter_type == "new":
+            query += " AND message LIKE '%NEW TICKETS%'"
+        elif filter_type == "vanished":
+            query += " AND message LIKE '%TICKETS GONE%'"
+        elif filter_type == "increase":
+            query += " AND message LIKE '%SEATS BEING BOOKED%' AND message NOT LIKE '%GONE%'"
+        elif filter_type == "decrease":
+            query += " AND message LIKE '%SEATS BEING BOOKED%'"
+
+        # Sort by most recent first
+        query += " ORDER BY sent_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+        cursor = self.conn.execute(query, params)
+        return cursor.fetchall()
+
+    def get_notification_count(self, filter_type: str = "all") -> int:
+        """Get total count of notifications for pagination."""
+        query = "SELECT COUNT(*) FROM notifications WHERE 1=1"
+
+        if filter_type == "new":
+            query += " AND message LIKE '%NEW TICKETS%'"
+        elif filter_type == "vanished":
+            query += " AND message LIKE '%TICKETS GONE%'"
+        elif filter_type == "increase":
+            query += " AND message LIKE '%SEATS BEING BOOKED%' AND message NOT LIKE '%GONE%'"
+        elif filter_type == "decrease":
+            query += " AND message LIKE '%SEATS BEING BOOKED%'"
+
+        cursor = self.conn.execute(query)
+        return cursor.fetchone()[0]
+
     def get_all_tracked_tickets(self, origin: Optional[str] = None,
                                 destination: Optional[str] = None,
                                 month: Optional[str] = None) -> list:
