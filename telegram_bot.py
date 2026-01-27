@@ -1375,28 +1375,30 @@ def build_alerts_page(notifications: list, page: int = 0,
         # Detect notification type from message
         if "NEW TICKETS" in msg_preview:
             emoji = "🎉"
-            notif_type = "New"
         elif "TICKETS GONE" in msg_preview:
             emoji = "💨"
-            notif_type = "Gone"
         elif "SEATS BEING BOOKED" in msg_preview:
             emoji = "📉"
-            notif_type = "Decrease"
         else:
             emoji = "📨"
-            notif_type = "Alert"
 
-        # Format route if available
-        route_str = f"{origin}→{destination}" if origin and destination else "Multiple routes"
-
+        # Show timestamp and message preview
         message += f"{emoji} <b>{time_str}</b>\n"
-        message += f"   {notif_type}: {route_str}"
-        if date:
-            message += f" ({date})"
-        if cabin:
-            cabin_name = {"AG": "Economy", "AP": "Premium", "AB": "Business"}.get(cabin, cabin)
-            message += f" - {cabin_name}"
-        message += "\n\n"
+
+        # Clean up and show the message content
+        # Remove HTML tags for cleaner display
+        preview = msg_preview.replace("<b>", "").replace("</b>", "")
+        preview = preview.replace("<i>", "").replace("</i>", "")
+        preview = preview.replace("\n\n", "\n")  # Reduce double newlines
+
+        # Show the preview with indentation
+        lines = preview.split('\n')
+        for line in lines[:4]:  # Show first 4 lines
+            line = line.strip()
+            if line:
+                message += f"   {line}\n"
+
+        message += "\n"
 
     # Build keyboard
     keyboard = []
