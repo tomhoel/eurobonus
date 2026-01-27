@@ -289,6 +289,8 @@ I can help you search for award availability on SAS routes.
 /status - System status
 /scan - Force immediate scan
 /notify - Subscribe to alerts
+/tickets - View ticket catalogue
+/gone - View sold tickets
 /help - Full help
 """
     # Create inline keyboard with popular destinations
@@ -351,6 +353,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /status - System health dashboard
 /scan - Force immediate scan of all monitored routes
 /notify - Subscribe/unsubscribe to alerts
+/tickets - View discovered tickets catalogue
+/gone - View sold/vanished tickets
 /help - Show this help message
 
 <b>Examples:</b>
@@ -361,6 +365,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 <code>/status</code>
 <code>/scan</code>
 <code>/notify</code>
+<code>/tickets</code>
+<code>/tickets OSL</code>
+<code>/gone</code>
 """
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
@@ -698,63 +705,110 @@ async def notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     adb = AvailabilityDatabase(db_path)
     try:
-        is_subscribed = adb.is_subscribed(chat_id)
+        subscriber = adb.get_subscriber(chat_id)
 
-        if action == "off":
-            # Unsubscribe
-            if adb.remove_subscriber(chat_id):
+        if action == "new":
+            # Subscribe to new ticket alerts
+            if subscriber:
+                adb.update_subscriber(chat_id, notify_new=True)
+                msg = "🔔 <b>Subscribed to NEW ticket alerts!</b>\n\n"
+            else:
+                adb.add_subscriber(chat_id, user.username, user.first_name, notify_new=True, notify_gone=False)
+                msg = "🔔 <b>Subscribed to NEW ticket alerts!</b>\n\n"
+
+            await update.message.reply_text(
+                msg + "You'll receive alerts when new award seats become available.\n\n"
+                "<i>Use /notify status to see your subscriptions.</i>",
+                parse_mode=ParseMode.HTML
+            )
+
+        elif action == "gone":
+            # Subscribe to vanishing ticket alerts
+            if subscriber:
+                adb.update_subscriber(chat_id, notify_gone=True)
+                msg = "💨 <b>Subscribed to GONE/SOLD alerts!</b>\n\n"
+            else:
+                adb.add_subscriber(chat_id, user.username, user.first_name, notify_new=False, notify_gone=True)
+                msg = "💨 <b>Subscribed to GONE/SOLD alerts!</b>\n\n"
+
+            await update.message.reply_text(
+                msg + "You'll receive alerts when tickets disappear (likely booked).\n\n"
+                "<i>Use /notify status to see your subscriptions.</i>",
+                parse_mode=ParseMode.HTML
+            )
+
+        elif action == "all":
+            # Subscribe to all alerts
+            if subscriber:
+                adb.update_subscriber(chat_id, notify_new=True, notify_gone=True)
+            else:
+                adb.add_subscriber(chat_id, user.username, user.first_name, notify_new=True, notify_gone=True)
+
+            await update.message.reply_text(
+                "🔔💨 <b>Subscribed to ALL alerts!</b>\n\n"
+                "You'll receive:\n"
+                "• 🆕 New ticket availability alerts\n"
+                "• 💨 Ticket gone/sold alerts\n\n"
+                "<i>Use /notify status to see your subscriptions.</i>",
+                parse_mode=ParseMode.HTML
+            )
+
+        elif action == "off":
+            # Unsubscribe from all
+            if subscriber:
+                adb.remove_subscriber(chat_id)
                 await update.message.reply_text(
-                    "🔕 <b>Unsubscribed!</b>\n\n"
-                    "You will no longer receive award availability alerts.\n"
+                    "🔕 <b>Unsubscribed from all alerts!</b>\n\n"
+                    "You will no longer receive any notifications.\n"
                     "Use /notify to subscribe again anytime.",
                     parse_mode=ParseMode.HTML
                 )
             else:
                 await update.message.reply_text(
-                    "ℹ️ You weren't subscribed to notifications.",
+                    "ℹ️ You weren't subscribed to any notifications.",
                     parse_mode=ParseMode.HTML
                 )
 
         elif action == "status":
-            # Check status
-            if is_subscribed:
-                await update.message.reply_text(
-                    "✅ <b>You are subscribed</b> to award availability alerts.\n\n"
-                    "Use /notify off to unsubscribe.",
-                    parse_mode=ParseMode.HTML
-                )
-            else:
-                await update.message.reply_text(
-                    "❌ <b>You are not subscribed</b> to notifications.\n\n"
-                    "Use /notify to subscribe.",
-                    parse_mode=ParseMode.HTML
-                )
+            # Show subscription status
+            if subscriber:
+                new_status = "✅ ON" if subscriber["notify_new"] else "❌ OFF"
+                gone_status = "✅ ON" if subscriber["notify_gone"] else "❌ OFF"
 
-        elif action in ("on", None):
-            # Subscribe
-            if is_subscribed:
                 await update.message.reply_text(
-                    "✅ You're already subscribed to notifications!\n\n"
-                    "Use /notify off to unsubscribe.",
+                    "📬 <b>Your Notification Settings</b>\n\n"
+                    f"🆕 New tickets: {new_status}\n"
+                    f"💨 Gone/sold alerts: {gone_status}\n\n"
+                    f"📅 Subscribed since: {subscriber['subscribed_at']}\n\n"
+                    "<b>Commands:</b>\n"
+                    "<code>/notify new</code> - Toggle new alerts\n"
+                    "<code>/notify gone</code> - Toggle gone alerts\n"
+                    "<code>/notify all</code> - Subscribe to all\n"
+                    "<code>/notify off</code> - Unsubscribe from all",
                     parse_mode=ParseMode.HTML
                 )
             else:
-                adb.add_subscriber(chat_id, user.username, user.first_name)
-                subscriber_count = adb.get_stats().get("subscriber_count", 1)
                 await update.message.reply_text(
-                    "🔔 <b>Subscribed successfully!</b>\n\n"
-                    "You'll now receive alerts when new SAS EuroBonus award tickets become available.\n\n"
-                    f"👥 You're subscriber #{subscriber_count}\n\n"
-                    "<i>Use /notify off to unsubscribe anytime.</i>",
+                    "📬 <b>Your Notification Settings</b>\n\n"
+                    "❌ You are not subscribed to any alerts.\n\n"
+                    "<b>Subscribe:</b>\n"
+                    "<code>/notify new</code> - New ticket alerts\n"
+                    "<code>/notify gone</code> - Ticket gone/sold alerts\n"
+                    "<code>/notify all</code> - All alerts",
                     parse_mode=ParseMode.HTML
                 )
 
         else:
+            # Show help
             await update.message.reply_text(
                 "📬 <b>Notification Settings</b>\n\n"
-                "<code>/notify</code> - Subscribe to alerts\n"
-                "<code>/notify off</code> - Unsubscribe\n"
-                "<code>/notify status</code> - Check your status",
+                "<b>Subscribe:</b>\n"
+                "<code>/notify new</code> - New ticket alerts 🆕\n"
+                "<code>/notify gone</code> - Ticket sold/gone alerts 💨\n"
+                "<code>/notify all</code> - All alerts\n\n"
+                "<b>Manage:</b>\n"
+                "<code>/notify off</code> - Unsubscribe from all\n"
+                "<code>/notify status</code> - Check your subscriptions",
                 parse_mode=ParseMode.HTML
             )
 
@@ -794,13 +848,187 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         subscribers = adb.get_subscribers_info()
         if subscribers:
             message += "\n<b>Subscriber List:</b>\n"
-            for chat_id, username, first_name, subscribed_at in subscribers:
+            for chat_id, username, first_name, notify_new, notify_gone, subscribed_at in subscribers:
                 name = f"@{username}" if username else first_name or "Unknown"
-                message += f"  • {name} (<code>{chat_id}</code>)\n"
+                subs = []
+                if notify_new:
+                    subs.append("🆕")
+                if notify_gone:
+                    subs.append("💨")
+                subs_str = "".join(subs) if subs else "❌"
+                message += f"  • {name} {subs_str} (<code>{chat_id}</code>)\n"
 
         message += "\n✅ <i>Monitor is running</i>"
 
         await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+    finally:
+        adb.close()
+
+
+async def tickets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /tickets command - show discovered tickets catalogue."""
+    from sas_monitor import AvailabilityDatabase, SASAwardAPI
+
+    db_path = context.bot_data.get("db_path", "sas_monitor.db")
+
+    # Parse arguments for filters
+    args = context.args
+    origin_filter = None
+    destination_filter = None
+
+    if args:
+        if len(args) >= 1:
+            origin_filter = args[0].upper()
+        if len(args) >= 2:
+            destination_filter = args[1].upper()
+
+    adb = AvailabilityDatabase(db_path)
+    try:
+        # Get routes for pagination
+        if origin_filter and destination_filter:
+            # Specific route
+            tickets = adb.get_all_discovered_tickets(origin_filter, destination_filter)
+            routes = [(origin_filter, destination_filter)] if tickets else []
+        elif origin_filter:
+            # Filter by origin
+            tickets = adb.get_all_discovered_tickets(origin_filter=origin_filter)
+            routes = list(set((t[0], t[1]) for t in tickets))
+        else:
+            # All routes
+            routes = adb.get_unique_routes()
+            tickets = adb.get_all_discovered_tickets()
+
+        if not tickets:
+            filter_text = ""
+            if origin_filter and destination_filter:
+                filter_text = f" for {origin_filter} → {destination_filter}"
+            elif origin_filter:
+                filter_text = f" from {origin_filter}"
+
+            await update.message.reply_text(
+                f"📋 <b>No tickets found{filter_text}</b>\n\n"
+                "Tickets are tracked when the monitor finds new availability.\n"
+                "Use /scan to trigger a scan now.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        # Group tickets by route
+        tickets_by_route = {}
+        for ticket in tickets:
+            origin, dest, date, cabin, seats, discovered = ticket
+            key = (origin, dest)
+            if key not in tickets_by_route:
+                tickets_by_route[key] = []
+            tickets_by_route[key].append((date, cabin, seats, discovered))
+
+        # Build message with pagination (show first 3 routes)
+        page = 0  # Could be made dynamic with callback buttons
+        routes_per_page = 3
+        start_idx = page * routes_per_page
+        end_idx = start_idx + routes_per_page
+
+        message = "📋 <b>Ticket Catalogue</b>\n"
+        if origin_filter:
+            message += f"<i>Filter: {origin_filter}"
+            if destination_filter:
+                message += f" → {destination_filter}"
+            message += "</i>\n"
+        message += f"<i>{len(tickets)} tickets across {len(routes)} routes</i>\n\n"
+
+        displayed_routes = list(tickets_by_route.keys())[start_idx:end_idx]
+
+        for origin, dest in displayed_routes:
+            route_tickets = tickets_by_route[(origin, dest)]
+            message += f"🛫 <b>{origin} → {dest}</b>\n"
+
+            for date, cabin, seats, discovered in sorted(route_tickets):
+                cabin_name = SASAwardAPI.CABIN_CODES.get(cabin, cabin)
+                # Format discovery time
+                disc_short = discovered[:16] if discovered else "Unknown"
+                message += f"  ├─ {date} | {cabin_name[:8]} | {seats} seat(s) | {disc_short}\n"
+
+            message += "\n"
+
+        # Add pagination info if more routes exist
+        total_pages = (len(routes) + routes_per_page - 1) // routes_per_page
+        if total_pages > 1:
+            message += f"📄 <i>Page 1/{total_pages} - Use /tickets to see more</i>\n"
+
+        # Add filter hint
+        if not origin_filter:
+            message += "\n💡 <i>Filter: /tickets OSL or /tickets OSL BKK</i>"
+
+        await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+    finally:
+        adb.close()
+
+
+async def gone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /gone command - show vanished/sold tickets overview."""
+    from sas_monitor import AvailabilityDatabase, SASAwardAPI
+
+    db_path = context.bot_data.get("db_path", "sas_monitor.db")
+
+    adb = AvailabilityDatabase(db_path)
+    try:
+        # Get vanished tickets stats
+        stats = adb.get_vanished_stats()
+        vanished = adb.get_vanished_tickets(limit=10)
+
+        if not vanished and stats["total_vanished"] == 0:
+            await update.message.reply_text(
+                "💨 <b>No Vanished Tickets Yet</b>\n\n"
+                "When tracked tickets disappear (likely booked), they'll appear here.\n\n"
+                "This helps you understand:\n"
+                "• How fast tickets sell\n"
+                "• Which routes are most popular\n"
+                "• Best time windows to book",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        message = "💨 <b>Vanished/Sold Tickets</b>\n\n"
+
+        # Stats summary
+        message += f"📊 <b>Statistics:</b>\n"
+        message += f"  • Total vanished: {stats['total_vanished']}\n"
+
+        if stats["avg_duration_seconds"]:
+            avg_hrs = stats["avg_duration_seconds"] // 3600
+            avg_mins = (stats["avg_duration_seconds"] % 3600) // 60
+            if avg_hrs > 0:
+                message += f"  • Avg time available: {avg_hrs}h {avg_mins}m\n"
+            else:
+                message += f"  • Avg time available: {avg_mins}m\n"
+
+        # Fastest selling routes
+        if stats["fastest_routes"]:
+            message += "\n🏃 <b>Fastest Selling Routes:</b>\n"
+            for origin, dest, count, avg_dur in stats["fastest_routes"][:3]:
+                if avg_dur:
+                    hrs = int(avg_dur) // 3600
+                    mins = (int(avg_dur) % 3600) // 60
+                    dur_str = f"{hrs}h {mins}m" if hrs > 0 else f"{mins}m"
+                    message += f"  • {origin}→{dest}: avg {dur_str} ({count} sold)\n"
+
+        # Recent vanished tickets
+        if vanished:
+            message += "\n📜 <b>Recently Gone:</b>\n"
+            for origin, dest, date, cabin, seats, disc_at, vanish_at, duration in vanished[:7]:
+                cabin_name = SASAwardAPI.CABIN_CODES.get(cabin, cabin)[:6]
+                dur_str = ""
+                if duration:
+                    hrs = duration // 3600
+                    mins = (duration % 3600) // 60
+                    dur_str = f" ({hrs}h{mins}m)" if hrs > 0 else f" ({mins}m)"
+                message += f"  • {origin}→{dest} {date} {cabin_name}{dur_str}\n"
+
+        message += "\n💡 <i>Subscribe: /notify gone</i>"
+
+        await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
     finally:
         adb.close()
 
@@ -1068,6 +1296,8 @@ class SASAwardBot:
         self.application.add_handler(CommandHandler("status", status_command))
         self.application.add_handler(CommandHandler("scan", scan_command))
         self.application.add_handler(CommandHandler("notify", notify_command))
+        self.application.add_handler(CommandHandler("tickets", tickets_command))
+        self.application.add_handler(CommandHandler("gone", gone_command))
 
         # Register callback query handler for inline buttons
         self.application.add_handler(CallbackQueryHandler(callback_handler))
@@ -1091,6 +1321,8 @@ class SASAwardBot:
             ("status", "System health dashboard"),
             ("scan", "Force immediate scan of all routes"),
             ("notify", "Subscribe to alerts"),
+            ("tickets", "View ticket catalogue"),
+            ("gone", "View sold/vanished tickets"),
             ("help", "Show all commands"),
         ]
         await application.bot.set_my_commands(commands)

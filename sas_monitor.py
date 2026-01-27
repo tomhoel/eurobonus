@@ -246,14 +246,59 @@ class AvailabilityDatabase:
                 chat_id TEXT NOT NULL UNIQUE,
                 username TEXT,
                 first_name TEXT,
+                notify_new INTEGER DEFAULT 1,
+                notify_gone INTEGER DEFAULT 0,
                 subscribed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE INDEX IF NOT EXISTS idx_subscribers_chat_id
             ON subscribers(chat_id);
+
+            CREATE TABLE IF NOT EXISTS discovered_tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                origin TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                date TEXT NOT NULL,
+                cabin_class TEXT NOT NULL,
+                seats_available INTEGER NOT NULL,
+                discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(origin, destination, date, cabin_class)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_discovered_route
+            ON discovered_tickets(origin, destination, date, cabin_class);
+
+            CREATE TABLE IF NOT EXISTS vanished_tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                origin TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                date TEXT NOT NULL,
+                cabin_class TEXT NOT NULL,
+                last_seats INTEGER NOT NULL,
+                discovered_at TIMESTAMP,
+                vanished_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                duration_seconds INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_vanished_route
+            ON vanished_tickets(origin, destination, date);
         """)
         self.conn.commit()
-    
+
+        # Migration: add new columns to existing subscribers table if missing
+        self._migrate_subscribers_table()
+
+    def _migrate_subscribers_table(self):
+        """Add new columns to subscribers table if they don't exist."""
+        cursor = self.conn.execute("PRAGMA table_info(subscribers)")
+        columns = [row[1] for row in cursor.fetchall()]
+
+        if "notify_new" not in columns:
+            self.conn.execute("ALTER TABLE subscribers ADD COLUMN notify_new INTEGER DEFAULT 1")
+        if "notify_gone" not in columns:
+            self.conn.execute("ALTER TABLE subscribers ADD COLUMN notify_gone INTEGER DEFAULT 0")
+        self.conn.commit()
+
     def store_availability(self, origin: str, destination: str, 
                           date: str, cabin_class: str, seats: int):
         """Store current availability snapshot."""
@@ -383,18 +428,45 @@ class AvailabilityDatabase:
 
         return stats
 
-    def add_subscriber(self, chat_id: str, username: str = None, first_name: str = None) -> bool:
+    def add_subscriber(self, chat_id: str, username: str = None, first_name: str = None,
+                       notify_new: bool = True, notify_gone: bool = False) -> bool:
         """Add a subscriber. Returns True if newly added, False if already exists."""
         try:
             self.conn.execute(
-                """INSERT INTO subscribers (chat_id, username, first_name)
-                   VALUES (?, ?, ?)""",
-                (str(chat_id), username, first_name)
+                """INSERT INTO subscribers (chat_id, username, first_name, notify_new, notify_gone)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (str(chat_id), username, first_name, int(notify_new), int(notify_gone))
             )
             self.conn.commit()
             return True
         except sqlite3.IntegrityError:
             return False
+
+    def update_subscriber(self, chat_id: str, notify_new: bool = None, notify_gone: bool = None,
+                         username: str = None, first_name: str = None):
+        """Update subscriber preferences."""
+        updates = []
+        params = []
+        if notify_new is not None:
+            updates.append("notify_new = ?")
+            params.append(int(notify_new))
+        if notify_gone is not None:
+            updates.append("notify_gone = ?")
+            params.append(int(notify_gone))
+        if username is not None:
+            updates.append("username = ?")
+            params.append(username)
+        if first_name is not None:
+            updates.append("first_name = ?")
+            params.append(first_name)
+
+        if updates:
+            params.append(str(chat_id))
+            self.conn.execute(
+                f"UPDATE subscribers SET {', '.join(updates)} WHERE chat_id = ?",
+                params
+            )
+            self.conn.commit()
 
     def remove_subscriber(self, chat_id: str) -> bool:
         """Remove a subscriber. Returns True if removed, False if didn't exist."""
@@ -405,25 +477,180 @@ class AvailabilityDatabase:
         self.conn.commit()
         return cursor.rowcount > 0
 
-    def is_subscribed(self, chat_id: str) -> bool:
-        """Check if a chat_id is subscribed."""
+    def get_subscriber(self, chat_id: str) -> dict:
+        """Get subscriber info including preferences."""
         cursor = self.conn.execute(
-            "SELECT 1 FROM subscribers WHERE chat_id = ?",
+            "SELECT chat_id, username, first_name, notify_new, notify_gone, subscribed_at FROM subscribers WHERE chat_id = ?",
+            (str(chat_id),)
+        )
+        row = cursor.fetchone()
+        if row:
+            return {
+                "chat_id": row[0],
+                "username": row[1],
+                "first_name": row[2],
+                "notify_new": bool(row[3]),
+                "notify_gone": bool(row[4]),
+                "subscribed_at": row[5]
+            }
+        return None
+
+    def is_subscribed(self, chat_id: str) -> bool:
+        """Check if a chat_id is subscribed to anything."""
+        cursor = self.conn.execute(
+            "SELECT 1 FROM subscribers WHERE chat_id = ? AND (notify_new = 1 OR notify_gone = 1)",
             (str(chat_id),)
         )
         return cursor.fetchone() is not None
 
+    def get_subscribers_for_new(self) -> list:
+        """Get chat_ids subscribed to new ticket alerts."""
+        cursor = self.conn.execute("SELECT chat_id FROM subscribers WHERE notify_new = 1")
+        return [row[0] for row in cursor.fetchall()]
+
+    def get_subscribers_for_gone(self) -> list:
+        """Get chat_ids subscribed to vanishing ticket alerts."""
+        cursor = self.conn.execute("SELECT chat_id FROM subscribers WHERE notify_gone = 1")
+        return [row[0] for row in cursor.fetchall()]
+
     def get_all_subscribers(self) -> list:
-        """Get all subscriber chat_ids."""
-        cursor = self.conn.execute("SELECT chat_id FROM subscribers")
+        """Get all subscriber chat_ids (for any notification type)."""
+        cursor = self.conn.execute("SELECT chat_id FROM subscribers WHERE notify_new = 1 OR notify_gone = 1")
         return [row[0] for row in cursor.fetchall()]
 
     def get_subscribers_info(self) -> list:
         """Get subscriber info for admin display."""
         cursor = self.conn.execute(
-            "SELECT chat_id, username, first_name, subscribed_at FROM subscribers ORDER BY subscribed_at"
+            "SELECT chat_id, username, first_name, notify_new, notify_gone, subscribed_at FROM subscribers ORDER BY subscribed_at"
         )
         return cursor.fetchall()
+
+    # Discovered tickets methods
+    def track_discovered_ticket(self, origin: str, destination: str, date: str,
+                                cabin_class: str, seats: int) -> bool:
+        """Track when a ticket is first discovered. Returns True if new."""
+        try:
+            self.conn.execute(
+                """INSERT INTO discovered_tickets (origin, destination, date, cabin_class, seats_available)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (origin, destination, date, cabin_class, seats)
+            )
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            # Already tracked
+            return False
+
+    def get_discovered_ticket(self, origin: str, destination: str, date: str,
+                              cabin_class: str) -> dict:
+        """Get discovery info for a ticket."""
+        cursor = self.conn.execute(
+            """SELECT discovered_at, seats_available FROM discovered_tickets
+               WHERE origin = ? AND destination = ? AND date = ? AND cabin_class = ?""",
+            (origin, destination, date, cabin_class)
+        )
+        row = cursor.fetchone()
+        if row:
+            return {"discovered_at": row[0], "seats": row[1]}
+        return None
+
+    def get_all_discovered_tickets(self, origin_filter: str = None,
+                                   destination_filter: str = None) -> list:
+        """Get all discovered tickets, optionally filtered."""
+        query = """SELECT origin, destination, date, cabin_class, seats_available, discovered_at
+                   FROM discovered_tickets WHERE 1=1"""
+        params = []
+
+        if origin_filter:
+            query += " AND origin = ?"
+            params.append(origin_filter)
+        if destination_filter:
+            query += " AND destination = ?"
+            params.append(destination_filter)
+
+        query += " ORDER BY origin, destination, date, cabin_class"
+        cursor = self.conn.execute(query, params)
+        return cursor.fetchall()
+
+    def get_unique_routes(self) -> list:
+        """Get list of unique routes from discovered tickets."""
+        cursor = self.conn.execute(
+            "SELECT DISTINCT origin, destination FROM discovered_tickets ORDER BY origin, destination"
+        )
+        return cursor.fetchall()
+
+    # Vanished tickets methods
+    def record_vanished_ticket(self, origin: str, destination: str, date: str,
+                               cabin_class: str, last_seats: int):
+        """Record when a ticket vanishes."""
+        # Get discovery time
+        discovered = self.get_discovered_ticket(origin, destination, date, cabin_class)
+        discovered_at = discovered["discovered_at"] if discovered else None
+
+        # Calculate duration
+        duration_seconds = None
+        if discovered_at:
+            try:
+                from datetime import datetime
+                disc_dt = datetime.strptime(discovered_at, "%Y-%m-%d %H:%M:%S")
+                duration_seconds = int((datetime.now() - disc_dt).total_seconds())
+            except:
+                pass
+
+        self.conn.execute(
+            """INSERT INTO vanished_tickets
+               (origin, destination, date, cabin_class, last_seats, discovered_at, duration_seconds)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (origin, destination, date, cabin_class, last_seats, discovered_at, duration_seconds)
+        )
+        self.conn.commit()
+
+        # Remove from discovered tickets
+        self.conn.execute(
+            "DELETE FROM discovered_tickets WHERE origin = ? AND destination = ? AND date = ? AND cabin_class = ?",
+            (origin, destination, date, cabin_class)
+        )
+        self.conn.commit()
+
+        return {"discovered_at": discovered_at, "duration_seconds": duration_seconds}
+
+    def get_vanished_tickets(self, limit: int = 50) -> list:
+        """Get recent vanished tickets."""
+        cursor = self.conn.execute(
+            """SELECT origin, destination, date, cabin_class, last_seats,
+                      discovered_at, vanished_at, duration_seconds
+               FROM vanished_tickets
+               ORDER BY vanished_at DESC
+               LIMIT ?""",
+            (limit,)
+        )
+        return cursor.fetchall()
+
+    def get_vanished_stats(self) -> dict:
+        """Get vanished tickets statistics."""
+        stats = {}
+
+        cursor = self.conn.execute("SELECT COUNT(*) FROM vanished_tickets")
+        stats["total_vanished"] = cursor.fetchone()[0]
+
+        cursor = self.conn.execute(
+            "SELECT AVG(duration_seconds) FROM vanished_tickets WHERE duration_seconds IS NOT NULL"
+        )
+        avg = cursor.fetchone()[0]
+        stats["avg_duration_seconds"] = int(avg) if avg else None
+
+        # Fastest selling routes
+        cursor = self.conn.execute(
+            """SELECT origin, destination, COUNT(*) as count, AVG(duration_seconds) as avg_dur
+               FROM vanished_tickets
+               WHERE duration_seconds IS NOT NULL
+               GROUP BY origin, destination
+               ORDER BY avg_dur ASC
+               LIMIT 5"""
+        )
+        stats["fastest_routes"] = cursor.fetchall()
+
+        return stats
 
     def close(self):
         self.conn.close()
@@ -465,21 +692,33 @@ class TelegramNotifier:
             logger.error(f"Telegram notification to {chat_id} failed: {e}")
             return False
 
-    def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
-        """Send a message to admin and all subscribers."""
+    def send_message(self, text: str, parse_mode: str = "HTML",
+                     notification_type: str = "new") -> bool:
+        """Send a message to admin and subscribers based on notification type.
+
+        Args:
+            text: Message text
+            parse_mode: Telegram parse mode
+            notification_type: "new" for new tickets, "gone" for vanished tickets
+        """
         if not self.enabled:
             logger.info(f"[DRY RUN] Would send: {text[:100]}...")
             return False
 
-        # Collect all recipients: admin + subscribers
+        # Collect all recipients: admin + appropriate subscribers
         recipients = set()
         recipients.add(self.chat_id)  # Admin always gets notifications
 
-        # Get subscribers from database
+        # Get subscribers from database based on type
         if self.db_path:
             try:
                 db = AvailabilityDatabase(self.db_path)
-                subscribers = db.get_all_subscribers()
+                if notification_type == "new":
+                    subscribers = db.get_subscribers_for_new()
+                elif notification_type == "gone":
+                    subscribers = db.get_subscribers_for_gone()
+                else:
+                    subscribers = db.get_all_subscribers()
                 recipients.update(subscribers)
                 db.close()
             except Exception as e:
@@ -491,7 +730,7 @@ class TelegramNotifier:
             if self._send_to_chat(chat_id, text, parse_mode):
                 success_count += 1
 
-        logger.info(f"Telegram notification sent to {success_count}/{len(recipients)} recipients")
+        logger.info(f"Telegram notification ({notification_type}) sent to {success_count}/{len(recipients)} recipients")
         return success_count > 0
     
     def format_availability_alert(
@@ -547,7 +786,9 @@ class TelegramNotifier:
         cabin_class: str,
         previous_seats: int,
         city_name: str = "",
-        direction: str = ""
+        direction: str = "",
+        discovered_at: str = None,
+        duration_seconds: int = None
     ) -> str:
         """Format a vanishing alert message."""
         class_name = SASAwardAPI.CABIN_CODES.get(cabin_class, cabin_class)
@@ -556,14 +797,28 @@ class TelegramNotifier:
         dest_display = f"{city_name} ({destination})" if city_name else destination
         direction_text = f" ({direction})" if direction else ""
 
-        return f"""💨 <b>TICKET VANISHED / BOOKED</b>
+        # Format duration
+        duration_text = ""
+        if duration_seconds is not None:
+            hours = duration_seconds // 3600
+            minutes = (duration_seconds % 3600) // 60
+            if hours > 0:
+                duration_text = f"\n⏱️ Was available for: <b>{hours}h {minutes}m</b>"
+            else:
+                duration_text = f"\n⏱️ Was available for: <b>{minutes}m</b>"
+
+        discovered_text = ""
+        if discovered_at:
+            discovered_text = f"\n🔍 Discovered: {discovered_at}"
+
+        return f"""💨 <b>TICKET SOLD / GONE</b>
 
 ✈️ <b>{origin} → {dest_display}</b>{direction_text}
 📅 Date: {date}
-💺 {class_name}: was <b>{previous_seats}</b> seat(s)
+💺 {class_name}: was <b>{previous_seats}</b> seat(s){discovered_text}{duration_text}
 
-🕐 Detected: {timestamp}
-⚠️ <i>These seats are no longer available.</i>"""
+🕐 Gone at: {timestamp}
+⚠️ <i>Likely booked by someone!</i>"""
 
 
 # ============================================================================
@@ -611,34 +866,30 @@ class SASAwardMonitor:
 
                 for cabin in cabin_classes:
                     seats = avail.get(cabin, 0)
-                    if seats > 0:
-                        if self.baseline_mode:
-                            # Baseline mode: store without notification
+                    prev = self.db.get_previous_availability(origin, destination, date, cabin)
+
+                    if self.baseline_mode:
+                        # Baseline mode: store without notification
+                        if seats > 0:
                             self.db.store_baseline(origin, destination, date, cabin, seats)
+                            # Also track as discovered for duration tracking
+                            self.db.track_discovered_ticket(origin, destination, date, cabin, seats)
                             alerts += 1
-                        else:
-                            # Normal mode: check if new or increased
-                            prev = self.db.get_previous_availability(
-                                origin, destination, date, cabin
-                            )
+                    else:
+                        # Check if this was in baseline
+                        is_baseline = self.db.is_baseline_ticket(origin, destination, date, cabin)
 
-                            # Check if this was in baseline
-                            is_baseline = self.db.is_baseline_ticket(
-                                origin, destination, date, cabin
-                            )
-
-                            # Alert only on truly new or increased availability
+                        if seats > 0:
+                            # Check if new or increased
                             should_alert = False
-                            is_vanishing = False
                             if prev is None and not is_baseline:
                                 # Truly new ticket (not in baseline)
                                 should_alert = True
+                                # Track discovery time
+                                self.db.track_discovered_ticket(origin, destination, date, cabin, seats)
                             elif prev is not None and seats > prev:
                                 # Seat increase
                                 should_alert = True
-                            elif prev is not None and seats < prev and seats == 0:
-                                # Seat disappearance (only notify when fully gone)
-                                is_vanishing = True
 
                             if should_alert:
                                 discovered_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -648,24 +899,33 @@ class SASAwardMonitor:
                                     direction=direction,
                                     discovered_at=discovered_at
                                 )
-                                if self.notifier.send_message(msg):
+                                if self.notifier.send_message(msg, notification_type="new"):
                                     self.db.log_notification(
                                         origin, destination, date, cabin, seats, msg
                                     )
                                 alerts += 1
-                            elif is_vanishing:
-                                # Notify on vanishing seats
-                                msg = self.notifier.format_vanishing_alert(
-                                    origin, destination, date, cabin,
-                                    prev, city_name, direction=direction
-                                )
-                                self.notifier.send_message(msg)
-                                alerts += 1
 
                             # Always store current state
-                            self.db.store_availability(
-                                origin, destination, date, cabin, seats
+                            self.db.store_availability(origin, destination, date, cabin, seats)
+
+                        elif seats == 0 and prev is not None and prev > 0:
+                            # Seats vanished (was available, now gone)
+                            # Record vanished ticket and get duration info
+                            vanish_info = self.db.record_vanished_ticket(
+                                origin, destination, date, cabin, prev
                             )
+
+                            msg = self.notifier.format_vanishing_alert(
+                                origin, destination, date, cabin,
+                                prev, city_name, direction=direction,
+                                discovered_at=vanish_info.get("discovered_at"),
+                                duration_seconds=vanish_info.get("duration_seconds")
+                            )
+                            self.notifier.send_message(msg, notification_type="gone")
+                            alerts += 1
+
+                            # Store zero availability
+                            self.db.store_availability(origin, destination, date, cabin, seats)
 
         return alerts
     
