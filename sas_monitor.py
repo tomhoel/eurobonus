@@ -163,7 +163,7 @@ class SASAwardAPI:
         cabin_class: str = "",
         availability: bool = True
     ) -> list:
-        """Make API request."""
+        """Make API request with retry and exponential backoff."""
         params = {
             "market": self.market,
             "origin": origin,
@@ -175,19 +175,32 @@ class SASAwardAPI:
             "selectedFlightClass": cabin_class,
         }
         
-        try:
-            response = self.session.get(self.base_url, params=params, timeout=30)
-            response.raise_for_status()
-            return response.json()
-        except requests.Timeout:
-            logger.error(f"Request timeout for {origin}->{destination}")
-            return []
-        except requests.RequestException as e:
-            logger.error(f"API request failed: {e}")
-            return []
-        except json.JSONDecodeError:
-            logger.error("Invalid JSON response")
-            return []
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(self.base_url, params=params, timeout=30)
+                response.raise_for_status()
+                return response.json()
+            except requests.Timeout:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # 1s, 2s, 4s
+                    logger.warning(f"Request timeout for {origin}->{destination}, retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Request timeout for {origin}->{destination} after {max_retries} retries")
+                    return []
+            except requests.RequestException as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    logger.warning(f"API request failed: {e}, retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"API request failed after {max_retries} retries: {e}")
+                    return []
+            except json.JSONDecodeError:
+                logger.error("Invalid JSON response")
+                return []
+        return []
 
 
 # ============================================================================
@@ -199,7 +212,10 @@ class AvailabilityDatabase:
     
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30.0)
+        # Enable WAL mode for concurrent access from monitor + bot
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=30000")
         self._init_tables()
     
     def _init_tables(self):
@@ -320,6 +336,7 @@ class AvailabilityDatabase:
                 destination TEXT NOT NULL,
                 date TEXT NOT NULL,
                 cabin_class TEXT NOT NULL,
+                direction TEXT DEFAULT 'outbound',
                 previous_seats INTEGER NOT NULL,
                 new_seats INTEGER NOT NULL,
                 change_amount INTEGER NOT NULL,
@@ -474,51 +491,58 @@ class AvailabilityDatabase:
                              previous_summary: Optional[dict] = None, direction: str = "outbound"):
         """Insert or update ticket summary with current availability."""
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        cursor = self.conn.cursor()
+        
+        try:
+            if previous_summary is None:
+                # First time seeing this ticket
+                cursor.execute(
+                    """INSERT INTO ticket_summary
+                       (origin, destination, date, cabin_class, direction, max_issued,
+                        currently_available, total_booked, first_seen_at,
+                        last_updated_at, booking_velocity)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (origin, destination, date, cabin_class, direction, current_seats,
+                     current_seats, 0, now, now, 0.0)
+                )
+            else:
+                # Update existing
+                new_max = max(previous_summary["max_issued"], current_seats)
+                total_booked = new_max - current_seats
 
-        if previous_summary is None:
-            # First time seeing this ticket
-            self.conn.execute(
-                """INSERT INTO ticket_summary
-                   (origin, destination, date, cabin_class, direction, max_issued,
-                    currently_available, total_booked, first_seen_at,
-                    last_updated_at, booking_velocity)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (origin, destination, date, cabin_class, direction, current_seats,
-                 current_seats, 0, now, now, 0.0)
-            )
-        else:
-            # Update existing
-            new_max = max(previous_summary["max_issued"], current_seats)
-            total_booked = new_max - current_seats
+                # Calculate velocity if seats decreased
+                velocity = previous_summary.get("booking_velocity", 0.0)
+                last_decrease_at = previous_summary.get("last_decrease_at")
 
-            # Calculate velocity if seats decreased
-            velocity = previous_summary.get("booking_velocity", 0.0)
-            last_decrease_at = previous_summary.get("last_decrease_at")
+                if current_seats < previous_summary["currently_available"]:
+                    # Seats decreased - calculate booking velocity
+                    seats_booked = previous_summary["currently_available"] - current_seats
+                    if last_decrease_at:
+                        try:
+                            last_dec_dt = datetime.strptime(last_decrease_at, "%Y-%m-%d %H:%M:%S")
+                            now_dt = datetime.utcnow()
+                            time_diff_hours = (now_dt - last_dec_dt).total_seconds() / 3600
+                            # Guard against div-by-zero (minimum 3.6 seconds)
+                            if time_diff_hours > 0.001:
+                                velocity = seats_booked / time_diff_hours
+                        except:
+                            pass
+                    last_decrease_at = now
 
-            if current_seats < previous_summary["currently_available"]:
-                # Seats decreased - calculate booking velocity
-                seats_booked = previous_summary["currently_available"] - current_seats
-                if last_decrease_at:
-                    try:
-                        last_dec_dt = datetime.strptime(last_decrease_at, "%Y-%m-%d %H:%M:%S")
-                        now_dt = datetime.utcnow()
-                        time_diff_hours = (now_dt - last_dec_dt).total_seconds() / 3600
-                        if time_diff_hours > 0:
-                            velocity = seats_booked / time_diff_hours
-                    except:
-                        pass
-                last_decrease_at = now
+                cursor.execute(
+                    """UPDATE ticket_summary
+                       SET max_issued=?, currently_available=?, total_booked=?,
+                           last_updated_at=?, last_decrease_at=?, booking_velocity=?
+                       WHERE origin=? AND destination=? AND date=? AND cabin_class=? AND direction=?""",
+                    (new_max, current_seats, total_booked, now, last_decrease_at,
+                     velocity, origin, destination, date, cabin_class, direction)
+                )
 
-            self.conn.execute(
-                """UPDATE ticket_summary
-                   SET max_issued=?, currently_available=?, total_booked=?,
-                       last_updated_at=?, last_decrease_at=?, booking_velocity=?
-                   WHERE origin=? AND destination=? AND date=? AND cabin_class=? AND direction=?""",
-                (new_max, current_seats, total_booked, now, last_decrease_at,
-                 velocity, origin, destination, date, cabin_class, direction)
-            )
-
-        self.conn.commit()
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            logger.error(f"Transaction failed in upsert_ticket_summary: {e}")
+            raise
 
     def get_notification_history(self, limit: int = 50, offset: int = 0,
                                  filter_type: str = "all") -> list:
@@ -625,7 +649,8 @@ class AvailabilityDatabase:
         return cursor.fetchall()
 
     def log_seat_change(self, origin: str, destination: str, date: str,
-                        cabin_class: str, previous_seats: int, new_seats: int):
+                        cabin_class: str, previous_seats: int, new_seats: int,
+                        direction: str = "outbound"):
         """Log a seat availability change for history tracking."""
         change_amount = new_seats - previous_seats
         if change_amount > 0:
@@ -638,10 +663,10 @@ class AvailabilityDatabase:
         try:
             self.conn.execute(
                 """INSERT INTO seat_changes 
-                   (origin, destination, date, cabin_class, previous_seats, 
+                   (origin, destination, date, cabin_class, direction, previous_seats, 
                     new_seats, change_amount, change_type)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (origin, destination, date, cabin_class, previous_seats, 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (origin, destination, date, cabin_class, direction, previous_seats, 
                  new_seats, change_amount, change_type)
             )
             self.conn.commit()
