@@ -1188,6 +1188,25 @@ class SASAwardMonitor:
                                 origin, destination, date, cabin, 0, summary
                             )
 
+                            # Store availability snapshot for sold-out state
+                            # This ensures prev=0 on next check, preventing stale data issues
+                            self.db.store_availability(
+                                origin, destination, date, cabin, 0
+                            )
+
+                        elif seats == 0 and summary is not None:
+                            # Seats are 0 but we have a summary (prev might be None due to
+                            # availability table being empty). Update summary to reflect sold out.
+                            if summary["currently_available"] > 0:
+                                logger.info(f"Correcting stale data: {origin}->{destination} {date} {cabin} was {summary['currently_available']}, now 0")
+                                self.db.upsert_ticket_summary(
+                                    origin, destination, date, cabin, 0, summary
+                                )
+                            # Store availability snapshot
+                            self.db.store_availability(
+                                origin, destination, date, cabin, 0
+                            )
+
         return changes
     
     def send_consolidated_notifications(self, changes: dict) -> int:
