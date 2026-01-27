@@ -278,18 +278,20 @@ def format_reverse_search_results(
 ) -> str:
     """
     Format search results for reverse search (all origins to a destination).
-    Groups results by origin airport.
+    Shows two sections: OUTBOUND (to destination) first, then RETURN (from destination).
     """
     dest_name = AIRPORT_NAMES.get(destination, destination)
 
     if not data:
         return (
-            f"🔍 <b>ALL ORIGINS → {dest_name} ({destination})</b>\n\n"
+            f"🔍 <b>ALL ROUTES → {dest_name} ({destination})</b>\n\n"
             f"❌ No availability data found."
         )
 
-    # Collect all availability across all origins
-    all_availability = []
+    # Collect all availability, separated by direction
+    outbound_flights = []  # Flying TO destination
+    return_flights = []    # Flying FROM destination
+
     for dest_data in data:
         origin = dest_data.get("origin", "")
         if not origin:
@@ -311,11 +313,10 @@ def format_reverse_search_results(
 
                 # Only include if has availability
                 if business + premium + economy > 0:
-                    all_availability.append({
+                    flight_info = {
                         'origin': origin,
                         'origin_name': origin_name,
                         'date': date,
-                        'direction': direction_key,
                         'business': business,
                         'premium': premium,
                         'economy': economy,
@@ -325,61 +326,80 @@ def format_reverse_search_results(
                             -(business + premium + economy),
                             date
                         )
-                    })
+                    }
+                    
+                    if direction_key == "outbound":
+                        outbound_flights.append(flight_info)
+                    else:
+                        return_flights.append(flight_info)
 
-    if not all_availability:
+    if not outbound_flights and not return_flights:
         return (
-            f"🔍 <b>ALL ORIGINS → {dest_name} ({destination})</b>\n\n"
+            f"🔍 <b>ALL ROUTES → {dest_name} ({destination})</b>\n\n"
             f"ℹ️ No available seats found."
         )
 
-    # Sort by priority
-    all_availability.sort(key=lambda x: x['sort_key'])
+    # Sort both lists
+    outbound_flights.sort(key=lambda x: x['sort_key'])
+    return_flights.sort(key=lambda x: x['sort_key'])
 
     # Build message
-    message = f"🔍 <b>ALL ORIGINS → {dest_name} ({destination})</b>\n\n"
-    message += f"Found {len(all_availability)} available flights\n"
-    message += f"<i>Sorted by: Business seats → Total seats → Date</i>\n\n"
+    total_flights = len(outbound_flights) + len(return_flights)
+    message = f"🔍 <b>ALL ROUTES → {dest_name} ({destination})</b>\n\n"
+    message += f"Found {total_flights} available flights\n\n"
 
-    # Group by origin for display
-    by_origin = {}
-    for item in all_availability[:50]:
-        orig = item['origin']
-        if orig not in by_origin:
-            by_origin[orig] = {
-                'origin_name': item['origin_name'],
-                'flights': []
-            }
-        by_origin[orig]['flights'].append(item)
+    # Helper function to build a section
+    def build_section(flights: list, limit: int = 25) -> str:
+        section = ""
+        by_origin = {}
+        for item in flights[:limit]:
+            orig = item['origin']
+            if orig not in by_origin:
+                by_origin[orig] = {
+                    'origin_name': item['origin_name'],
+                    'flights': []
+                }
+            by_origin[orig]['flights'].append(item)
 
-    for origin, orig_info in list(by_origin.items())[:10]:
-        message += f"✈️ <b>{orig_info['origin_name']} ({origin})</b>\n"
+        for origin, orig_info in list(by_origin.items())[:8]:
+            section += f"✈️ <b>{orig_info['origin_name']} ({origin})</b>\n"
 
-        for flight in orig_info['flights'][:5]:
-            # Format date
-            try:
-                date_obj = datetime.strptime(flight['date'], "%Y-%m-%d")
-                date_display = date_obj.strftime("%b %d")
-            except:
-                date_display = flight['date']
+            for flight in orig_info['flights'][:5]:
+                # Format date
+                try:
+                    date_obj = datetime.strptime(flight['date'], "%Y-%m-%d")
+                    date_display = date_obj.strftime("%b %d")
+                except:
+                    date_display = flight['date']
 
-            direction_emoji = "📤" if flight['direction'] == "outbound" else "📥"
+                # Build seat info
+                seat_parts = []
+                if flight['business'] > 0:
+                    seat_parts.append(f"💼 Business: {flight['business']}")
+                if flight['premium'] > 0:
+                    seat_parts.append(f"⭐ Premium: {flight['premium']}")
+                if flight['economy'] > 0:
+                    seat_parts.append(f"💺 Economy: {flight['economy']}")
 
-            # Build seat info
-            seat_parts = []
-            if flight['business'] > 0:
-                seat_parts.append(f"💼 Business: {flight['business']}")
-            if flight['premium'] > 0:
-                seat_parts.append(f"⭐ Premium: {flight['premium']}")
-            if flight['economy'] > 0:
-                seat_parts.append(f"💺 Economy: {flight['economy']}")
+                section += f"  {date_display}: {', '.join(seat_parts)}\n"
 
-            message += f"  {direction_emoji} {date_display}: {', '.join(seat_parts)}\n"
+            section += "\n"
+        
+        return section
 
-        message += "\n"
+    # Section 1: OUTBOUND (flying TO destination)
+    if outbound_flights:
+        message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        message += f"📤 <b>OUTBOUND (Flying TO {dest_name})</b>\n"
+        message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        message += build_section(outbound_flights)
 
-    if len(by_origin) > 10:
-        message += f"<i>...and {len(by_origin) - 10} more origins</i>\n\n"
+    # Section 2: RETURN (flying FROM destination)
+    if return_flights:
+        message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        message += f"📥 <b>RETURN (Flying FROM {dest_name})</b>\n"
+        message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        message += build_section(return_flights)
 
     booking_url = f"https://www.sas.no/award-finder?destination={destination}"
     message += f'<a href="{booking_url}">🔗 Book on SAS</a>'
