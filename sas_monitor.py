@@ -296,6 +296,21 @@ class AvailabilityDatabase:
 
             CREATE INDEX IF NOT EXISTS idx_sales_history_velocity
             ON ticket_sales_history(avg_velocity DESC);
+
+            CREATE TABLE IF NOT EXISTS ticket_notification_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                origin TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                date TEXT NOT NULL,
+                cabin_class TEXT NOT NULL,
+                notification_type TEXT NOT NULL,
+                seats_value INTEGER,
+                notified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(origin, destination, date, cabin_class, notification_type, notified_at)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_ticket_notification
+            ON ticket_notification_log(origin, destination, date, cabin_class, notification_type);
         """)
         self.conn.commit()
     
@@ -343,6 +358,36 @@ class AvailabilityDatabase:
             (message_hash, cutoff_time)
         )
         return cursor.fetchone()[0] > 0
+
+    def was_ticket_notified_recently(self, origin: str, destination: str,
+                                     date: str, cabin: str,
+                                     notification_type: str, hours: int = 24) -> bool:
+        """Check if this specific ticket was notified about recently."""
+        cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+        cursor = self.conn.execute(
+            """SELECT COUNT(*) FROM ticket_notification_log
+               WHERE origin=? AND destination=? AND date=? AND cabin_class=?
+               AND notification_type=? AND notified_at > ?""",
+            (origin, destination, date, cabin, notification_type, cutoff)
+        )
+        return cursor.fetchone()[0] > 0
+
+    def log_ticket_notification(self, origin: str, destination: str,
+                                date: str, cabin: str,
+                                notification_type: str, seats_value: int):
+        """Log that a notification was sent for this ticket."""
+        try:
+            self.conn.execute(
+                """INSERT INTO ticket_notification_log
+                   (origin, destination, date, cabin_class, notification_type, seats_value)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (origin, destination, date, cabin, notification_type, seats_value)
+            )
+            self.conn.commit()
+        except Exception as e:
+            # If duplicate (same ticket notified in same second), ignore
+            if "UNIQUE constraint failed" not in str(e):
+                logger.warning(f"Failed to log ticket notification: {e}")
 
     def store_baseline(self, origin: str, destination: str,
                       date: str, cabin_class: str, seats: int):
@@ -880,28 +925,40 @@ class SASAwardMonitor:
                         if seats > 0:
                             # Detect type of change
                             if prev is None and not is_baseline:
-                                # Truly new ticket (not in baseline)
-                                changes['new_tickets'].append({
-                                    'origin': origin,
-                                    'destination': destination,
-                                    'city_name': city_name,
-                                    'date': date,
-                                    'cabin': cabin,
-                                    'seats': seats,
-                                    'direction': direction
-                                })
+                                # Truly new ticket (not in baseline) - check if we already notified
+                                if not self.db.was_ticket_notified_recently(
+                                    origin, destination, date, cabin, 'new', hours=24
+                                ):
+                                    changes['new_tickets'].append({
+                                        'origin': origin,
+                                        'destination': destination,
+                                        'city_name': city_name,
+                                        'date': date,
+                                        'cabin': cabin,
+                                        'seats': seats,
+                                        'direction': direction
+                                    })
+                                    self.db.log_ticket_notification(
+                                        origin, destination, date, cabin, 'new', seats
+                                    )
                             elif prev is not None and seats > prev:
-                                # Seat increase
-                                changes['seat_increases'].append({
-                                    'origin': origin,
-                                    'destination': destination,
-                                    'city_name': city_name,
-                                    'date': date,
-                                    'cabin': cabin,
-                                    'seats': seats,
-                                    'previous_seats': prev,
-                                    'direction': direction
-                                })
+                                # Seat increase - check if we already notified
+                                if not self.db.was_ticket_notified_recently(
+                                    origin, destination, date, cabin, 'increase', hours=24
+                                ):
+                                    changes['seat_increases'].append({
+                                        'origin': origin,
+                                        'destination': destination,
+                                        'city_name': city_name,
+                                        'date': date,
+                                        'cabin': cabin,
+                                        'seats': seats,
+                                        'previous_seats': prev,
+                                        'direction': direction
+                                    })
+                                    self.db.log_ticket_notification(
+                                        origin, destination, date, cabin, 'increase', seats
+                                    )
                             elif prev is not None and seats < prev:
                                 # Seat decrease (but not gone)
                                 changes['seat_decreases'].append({
@@ -926,18 +983,28 @@ class SASAwardMonitor:
                             )
 
                         elif prev is not None and prev > 0 and seats == 0:
-                            # Ticket vanished
-                            changes['vanished'].append({
-                                'origin': origin,
-                                'destination': destination,
-                                'city_name': city_name,
-                                'date': date,
-                                'cabin': cabin,
-                                'previous_seats': prev,
-                                'direction': direction
-                            })
+                            # Ticket vanished - check if we already notified about this specific ticket
+                            if not self.db.was_ticket_notified_recently(
+                                origin, destination, date, cabin, 'vanished', hours=24
+                            ):
+                                changes['vanished'].append({
+                                    'origin': origin,
+                                    'destination': destination,
+                                    'city_name': city_name,
+                                    'date': date,
+                                    'cabin': cabin,
+                                    'previous_seats': prev,
+                                    'direction': direction
+                                })
 
-                            # Update ticket summary for vanished
+                                # Log the notification intent (actual send happens later)
+                                self.db.log_ticket_notification(
+                                    origin, destination, date, cabin, 'vanished', prev
+                                )
+                            else:
+                                logger.info(f"Skipping duplicate vanished notification: {origin}->{destination} {date} {cabin}")
+
+                            # Update ticket summary for vanished (always update, even if not notifying)
                             self.db.upsert_ticket_summary(
                                 origin, destination, date, cabin, 0, summary
                             )
@@ -971,7 +1038,12 @@ class SASAwardMonitor:
                 changes['new_tickets'],
                 changes['seat_increases']
             )
-            msg_hash = hashlib.md5(msg.encode()).hexdigest()
+
+            # Compute hash from ticket identities, not message content (fixes timestamp issue)
+            ticket_keys = []
+            for t in changes['new_tickets'] + changes['seat_increases']:
+                ticket_keys.append(f"{t['origin']}|{t['destination']}|{t['date']}|{t['cabin']}")
+            msg_hash = hashlib.md5(('NEW:' + '|'.join(sorted(ticket_keys))).encode()).hexdigest()
 
             if not self.db.was_recently_notified(msg_hash, hours=24):
                 sent_count = self.notifier.broadcast_message(msg, subscribers)
@@ -979,11 +1051,18 @@ class SASAwardMonitor:
                     self.db.log_notification("", "", "", "", 0, msg, msg_hash)
                     notifications_sent += 1
                     logger.info(f"Broadcast new tickets to {sent_count} subscribers ({len(changes['new_tickets'])} new, {len(changes['seat_increases'])} increases)")
+                    logger.info(f"Notification hash: {msg_hash}")
 
         # 2. Send DECREASES message
         if changes['seat_decreases']:
             msg = self.format_decreases_message(changes['seat_decreases'])
-            msg_hash = hashlib.md5(msg.encode()).hexdigest()
+
+            # Compute hash from ticket identities, not message content (fixes timestamp issue)
+            ticket_keys = [
+                f"{t['origin']}|{t['destination']}|{t['date']}|{t['cabin']}"
+                for t in changes['seat_decreases']
+            ]
+            msg_hash = hashlib.md5(('DECREASE:' + '|'.join(sorted(ticket_keys))).encode()).hexdigest()
 
             if not self.db.was_recently_notified(msg_hash, hours=24):
                 sent_count = self.notifier.broadcast_message(msg, subscribers)
@@ -991,11 +1070,18 @@ class SASAwardMonitor:
                     self.db.log_notification("", "", "", "", 0, msg, msg_hash)
                     notifications_sent += 1
                     logger.info(f"Broadcast decreases to {sent_count} subscribers ({len(changes['seat_decreases'])} tickets)")
+                    logger.info(f"Notification hash: {msg_hash}")
 
         # 3. Send VANISHED message (also record in sales history)
         if changes['vanished']:
             msg = self.format_vanished_message(changes['vanished'])
-            msg_hash = hashlib.md5(msg.encode()).hexdigest()
+
+            # Compute hash from ticket identities, not message content (fixes timestamp issue)
+            ticket_keys = [
+                f"{t['origin']}|{t['destination']}|{t['date']}|{t['cabin']}"
+                for t in changes['vanished']
+            ]
+            msg_hash = hashlib.md5(('VANISHED:' + '|'.join(sorted(ticket_keys))).encode()).hexdigest()
 
             if not self.db.was_recently_notified(msg_hash, hours=24):
                 sent_count = self.notifier.broadcast_message(msg, subscribers)
@@ -1003,6 +1089,7 @@ class SASAwardMonitor:
                     self.db.log_notification("", "", "", "", 0, msg, msg_hash)
                     notifications_sent += 1
                     logger.info(f"Broadcast vanished to {sent_count} subscribers ({len(changes['vanished'])} tickets)")
+                    logger.info(f"Notification hash: {msg_hash}")
 
             # Record sales history for each vanished ticket
             for ticket in changes['vanished']:
