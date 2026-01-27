@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 # Import SAS API from the monitor
-from sas_monitor import SASAwardAPI, Config
+from sas_monitor import SASAwardAPI, Config, DESTINATIONS, ORIGINS
 
 # ============================================================================
 # Configuration
@@ -84,13 +84,19 @@ def parse_route(text: str) -> Optional[tuple[str, str, Optional[str]]]:
     - osl bkk
     - OSL BKK July (with month)
     - OSL BKK 2026-03 (with month)
+    - to BKK (reverse search - all origins to destination)
+    - TO BKK July (reverse search with month)
 
     Returns:
         Tuple of (origin, destination, month) or None if invalid
         destination can be None for origin-only queries
+        origin can be None for reverse (destination-only) queries
     """
     # Remove command prefix if present
     text = re.sub(r'^/(search|history|calendar)\s+', '', text, flags=re.IGNORECASE)
+
+    # Check for reverse search pattern "to DESTINATION"
+    reverse_match = re.search(r'\bto\s+([A-Za-z]{3})\b', text, re.IGNORECASE)
 
     # Check for month parameter (e.g., "July", "March", "2026-03")
     month_pattern = r'\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{4}-\d{2})\b'
@@ -116,6 +122,14 @@ def parse_route(text: str) -> Optional[tuple[str, str, Optional[str]]]:
             month = month_str.replace('-', '')
         # Remove month from text for airport code extraction
         text = re.sub(month_pattern, '', text, flags=re.IGNORECASE)
+
+    # Handle reverse search
+    if reverse_match:
+        destination = reverse_match.group(1).upper()
+        if destination not in AIRPORT_NAMES:
+            return None
+        # Return None as origin to indicate reverse search
+        return None, destination, month
 
     # Extract airport codes (3 letters)
     codes = re.findall(r'\b([A-Za-z]{3})\b', text)
@@ -487,7 +501,10 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Handle /search command.
 
     Parses route, queries SAS API, and returns formatted results.
-    Supports both origin+destination and origin-only queries.
+    Supports:
+    - origin+destination queries (e.g., /search OSL BKK)
+    - origin-only queries (e.g., /search OSL) - shows tracked destinations only
+    - reverse search (e.g., /search to BKK) - shows all origins to destination
     """
     user = update.effective_user
     query_text = update.message.text
@@ -512,29 +529,82 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ API client not initialized", parse_mode=ParseMode.HTML)
         return
 
-    # Check if origin-only query
-    if destination is None:
-        # Origin-only search - query all destinations
+    # Check for reverse search (origin is None)
+    if origin is None and destination is not None:
+        # Reverse search - find all origins going to this destination
         month_text = f" ({month[:4]}-{month[4:]})" if month else ""
+        dest_name = AIRPORT_NAMES.get(destination, destination)
         status_msg = await update.message.reply_text(
-            f"🔍 Searching {origin} → ALL DESTINATIONS{month_text}...",
+            f"🔍 Searching ALL ORIGINS → {dest_name} ({destination}){month_text}...",
             parse_mode=ParseMode.HTML
         )
 
         try:
-            logger.info(f"Querying SAS API for all destinations from {origin}")
-            # Get all destinations from origin
-            data = api.get_destinations(origin)
+            logger.info(f"Reverse search for all origins to {destination}")
 
-            # Filter data to only include destinations we support
+            # Query each tracked origin to this destination
             filtered_data = []
-            for dest in data:
-                dest_code = dest.get("airportCode", "")
-                if dest_code in AIRPORT_NAMES:
-                    # Query availability for this destination
-                    avail_data = api.get_availability(origin=origin, destination=dest_code, month=month or "")
+            for orig in ORIGINS:
+                try:
+                    avail_data = api.get_availability(origin=orig, destination=destination, month=month or "")
                     if avail_data:
                         filtered_data.extend(avail_data)
+                except:
+                    # Skip origins that fail
+                    pass
+
+            # Format results using origin search formatter (it groups by destination)
+            # But we'll modify the header to show it's a reverse search
+            if not filtered_data:
+                result_message = (
+                    f"🔍 <b>ALL ORIGINS → {dest_name} ({destination})</b>\n\n"
+                    f"❌ No availability found."
+                )
+            else:
+                result_message = format_origin_search_results(None, filtered_data, month)
+                # Replace header
+                result_message = result_message.replace(
+                    "ALL DESTINATIONS",
+                    f"ALL ORIGINS → {dest_name} ({destination})"
+                )
+
+            await status_msg.edit_text(
+                result_message,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+
+            logger.info(f"Reverse search completed: ALL → {destination}")
+
+        except Exception as e:
+            logger.error(f"Reverse search failed: {e}")
+            error_msg = format_error_message("api_error", str(e))
+            await status_msg.edit_text(error_msg, parse_mode=ParseMode.HTML)
+
+        return
+
+    # Check if origin-only query
+    if destination is None:
+        # Origin-only search - query only tracked destinations
+        month_text = f" ({month[:4]}-{month[4:]})" if month else ""
+        status_msg = await update.message.reply_text(
+            f"🔍 Searching {origin} → TRACKED DESTINATIONS{month_text}...",
+            parse_mode=ParseMode.HTML
+        )
+
+        try:
+            logger.info(f"Querying SAS API for tracked destinations from {origin}")
+
+            # Query only tracked DESTINATIONS (not all airports)
+            filtered_data = []
+            for dest in DESTINATIONS:
+                try:
+                    avail_data = api.get_availability(origin=origin, destination=dest, month=month or "")
+                    if avail_data:
+                        filtered_data.extend(avail_data)
+                except:
+                    # Skip destinations that fail
+                    pass
 
             # Format results
             result_message = format_origin_search_results(origin, filtered_data, month)
@@ -545,7 +615,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True
             )
 
-            logger.info(f"Origin-only search completed: {origin} → ALL")
+            logger.info(f"Origin-only search completed: {origin} → TRACKED DESTINATIONS")
 
         except Exception as e:
             logger.error(f"Origin search failed: {e}")
