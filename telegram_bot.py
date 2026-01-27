@@ -77,15 +77,17 @@ def parse_route(text: str) -> Optional[tuple[str, str, Optional[str]]]:
     Parse route from user input.
 
     Accepts formats:
-    - OSL - BKK
+    - OSL - BKK (origin and destination)
     - OSL-BKK
     - OSL BKK
+    - OSL (origin only - returns all destinations)
     - osl bkk
     - OSL BKK July (with month)
     - OSL BKK 2026-03 (with month)
 
     Returns:
         Tuple of (origin, destination, month) or None if invalid
+        destination can be None for origin-only queries
     """
     # Remove command prefix if present
     text = re.sub(r'^/(search|history|calendar)\s+', '', text, flags=re.IGNORECASE)
@@ -118,21 +120,142 @@ def parse_route(text: str) -> Optional[tuple[str, str, Optional[str]]]:
     # Extract airport codes (3 letters)
     codes = re.findall(r'\b([A-Za-z]{3})\b', text)
 
-    if len(codes) < 2:
+    if len(codes) < 1:
         return None
 
-    origin, destination = [code.upper() for code in codes[:2]]
+    origin = codes[0].upper()
 
-    # Validate against known airports
-    if origin not in AIRPORT_NAMES or destination not in AIRPORT_NAMES:
+    # Validate origin
+    if origin not in AIRPORT_NAMES:
         return None
 
-    return origin, destination, month
+    # Check if destination provided
+    if len(codes) >= 2:
+        destination = codes[1].upper()
+        # Validate destination
+        if destination not in AIRPORT_NAMES:
+            return None
+        return origin, destination, month
+    else:
+        # Origin-only query
+        return origin, None, month
 
 
 # ============================================================================
 # Message Formatters
 # ============================================================================
+
+def format_origin_search_results(
+    origin: str,
+    data: List[Dict],
+    month: Optional[str] = None
+) -> str:
+    """
+    Format search results for origin-only query (all destinations).
+    Sort by: Business seats > Premium > Economy, then by soonest date.
+    """
+    if not data:
+        return (
+            f"🔍 <b>Search: {origin} → ALL DESTINATIONS</b>\n\n"
+            f"❌ No availability data found."
+        )
+
+    # Collect all availability across all destinations
+    all_availability = []
+    for dest_data in data:
+        destination = dest_data.get("airportCode", "")
+        city_name = dest_data.get("cityName", AIRPORT_NAMES.get(destination, destination))
+
+        for direction_key in ["outbound", "inbound"]:
+            direction_data = dest_data.get("availability", {}).get(direction_key, [])
+            for avail in direction_data:
+                date = avail.get("date", "")
+                if not date:
+                    continue
+
+                # Get seat counts
+                business = avail.get("AB", 0)
+                premium = avail.get("AP", 0)
+                economy = avail.get("AG", 0)
+
+                # Only include if has availability
+                if business + premium + economy > 0:
+                    all_availability.append({
+                        'destination': destination,
+                        'city_name': city_name,
+                        'date': date,
+                        'direction': direction_key,
+                        'business': business,
+                        'premium': premium,
+                        'economy': economy,
+                        # Sort key: prioritize business, then total seats, then date
+                        'sort_key': (
+                            -business,  # Most business seats first (negative for descending)
+                            -(business + premium + economy),  # Then total seats
+                            date  # Then earliest date
+                        )
+                    })
+
+    if not all_availability:
+        return (
+            f"🔍 <b>Search: {origin} → ALL DESTINATIONS</b>\n\n"
+            f"ℹ️ No available seats found."
+        )
+
+    # Sort by priority
+    all_availability.sort(key=lambda x: x['sort_key'])
+
+    # Build message
+    origin_name = AIRPORT_NAMES.get(origin, origin)
+    message = f"🔍 <b>{origin_name} ({origin}) → ALL DESTINATIONS</b>\n\n"
+    message += f"Found {len(all_availability)} available flights\n"
+    message += f"<i>Sorted by: Business seats → Total seats → Date</i>\n\n"
+
+    # Group by destination for display
+    by_destination = {}
+    for item in all_availability[:50]:  # Limit to 50 results
+        dest = item['destination']
+        if dest not in by_destination:
+            by_destination[dest] = {
+                'city_name': item['city_name'],
+                'flights': []
+            }
+        by_destination[dest]['flights'].append(item)
+
+    for destination, dest_info in list(by_destination.items())[:10]:  # Show top 10 destinations
+        message += f"✈️ <b>{dest_info['city_name']} ({destination})</b>\n"
+
+        for flight in dest_info['flights'][:5]:  # Show top 5 flights per destination
+            # Format date
+            try:
+                date_obj = datetime.strptime(flight['date'], "%Y-%m-%d")
+                date_display = date_obj.strftime("%b %d")
+            except:
+                date_display = flight['date']
+
+            direction_emoji = "📤" if flight['direction'] == "outbound" else "📥"
+
+            # Build seat info
+            seat_parts = []
+            if flight['business'] > 0:
+                seat_parts.append(f"💼 Business: {flight['business']}")
+            if flight['premium'] > 0:
+                seat_parts.append(f"⭐ Premium: {flight['premium']}")
+            if flight['economy'] > 0:
+                seat_parts.append(f"💺 Economy: {flight['economy']}")
+
+            message += f"  {direction_emoji} {date_display}: {', '.join(seat_parts)}\n"
+
+        message += "\n"
+
+    if len(by_destination) > 10:
+        message += f"<i>...and {len(by_destination) - 10} more destinations</i>\n\n"
+
+    booking_url = f"https://www.sas.no/award-finder?origin={origin}"
+    message += f'<a href="{booking_url}">🔗 Book on SAS</a>'
+
+    return message.strip()
+
 
 def format_search_results(
     origin: str,
@@ -320,42 +443,41 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
 <b>SAS EuroBonus Award Search Bot</b>
 
-<b>Supported Origins:</b>
-🇳🇴 OSL - Oslo
-🇫🇷 CDG - Paris
-🇩🇰 CPH - Copenhagen
-🇳🇱 AMS - Amsterdam
+<b>🔔 Notifications:</b>
+/notify - Subscribe to instant alerts
+/unsubscribe - Stop notifications
 
-<b>Supported Destinations:</b>
-🇹🇭 BKK - Bangkok
-🇯🇵 NRT - Tokyo Narita
-🇯🇵 HND - Tokyo Haneda
-🇯🇵 KIX - Osaka
-🇨🇳 PVG - Shanghai
-🇨🇳 PEK - Beijing
-🇻🇳 SGN - Ho Chi Minh City
-🇻🇳 HAN - Hanoi
-🇸🇬 SIN - Singapore
+<b>🔍 Search:</b>
+/search OSL BKK - Search specific route
+/search OSL - Search all from Oslo
+/search OSL BKK July - Filter by month
 
-<b>Commands:</b>
-/search OSL BKK - Search for availability
-/search OSL BKK July - Search with month filter
+<b>📚 Browse Tickets:</b>
+/catalogue - Browse all tracked tickets
 /tickets - View all tracked tickets
-/tickets OSL-BKK - View specific route tickets
-/velocity - See hottest tickets (booking fast)
-/calendar OSL BKK - Emoji grid calendar view
-/history OSL BKK - Show release history
+/tickets OSL-BKK - View specific route
+/tickets OSL-BKK 2026-02 - Filter by month
+
+<b>📊 Analytics:</b>
+/sales - Fastest selling tickets
+/velocity - Hottest tickets (booking now)
+/stats - System statistics
 /best - Best business class availability
-/stats - Enhanced statistics dashboard
-/status - System health dashboard
-/help - Show this help message
+
+<b>📅 Other:</b>
+/calendar OSL BKK - Emoji calendar view
+/history OSL BKK - Release history
+/status - System health
+
+<b>Supported Routes:</b>
+Origins: OSL, CDG, CPH, AMS
+Destinations: BKK, NRT, HND, KIX, PVG, PEK, SGN, HAN, SIN
 
 <b>Examples:</b>
-<code>/search OSL BKK</code>
-<code>/tickets OSL-BKK 2026-02</code>
-<code>/velocity</code>
-<code>/calendar CPH NRT</code>
-<code>/stats</code>
+<code>/notify</code>
+<code>/search OSL</code>
+<code>/catalogue</code>
+<code>/sales</code>
 """
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
@@ -365,6 +487,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Handle /search command.
 
     Parses route, queries SAS API, and returns formatted results.
+    Supports both origin+destination and origin-only queries.
     """
     user = update.effective_user
     query_text = update.message.text
@@ -383,7 +506,55 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     origin, destination, month = parsed
 
-    # Send "searching" message
+    # Get API client from context
+    api: SASAwardAPI = context.bot_data.get("api")
+    if not api:
+        await update.message.reply_text("❌ API client not initialized", parse_mode=ParseMode.HTML)
+        return
+
+    # Check if origin-only query
+    if destination is None:
+        # Origin-only search - query all destinations
+        month_text = f" ({month[:4]}-{month[4:]})" if month else ""
+        status_msg = await update.message.reply_text(
+            f"🔍 Searching {origin} → ALL DESTINATIONS{month_text}...",
+            parse_mode=ParseMode.HTML
+        )
+
+        try:
+            logger.info(f"Querying SAS API for all destinations from {origin}")
+            # Get all destinations from origin
+            data = api.get_destinations(origin)
+
+            # Filter data to only include destinations we support
+            filtered_data = []
+            for dest in data:
+                dest_code = dest.get("airportCode", "")
+                if dest_code in AIRPORT_NAMES:
+                    # Query availability for this destination
+                    avail_data = api.get_availability(origin=origin, destination=dest_code, month=month or "")
+                    if avail_data:
+                        filtered_data.extend(avail_data)
+
+            # Format results
+            result_message = format_origin_search_results(origin, filtered_data, month)
+
+            await status_msg.edit_text(
+                result_message,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+
+            logger.info(f"Origin-only search completed: {origin} → ALL")
+
+        except Exception as e:
+            logger.error(f"Origin search failed: {e}")
+            error_msg = format_error_message("api_error", str(e))
+            await status_msg.edit_text(error_msg, parse_mode=ParseMode.HTML)
+
+        return
+
+    # Regular origin + destination search
     month_text = f" ({month[:4]}-{month[4:]})" if month else ""
     status_msg = await update.message.reply_text(
         f"🔍 Searching {origin} → {destination}{month_text}...",
@@ -391,13 +562,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        # Get API client from context (passed during initialization)
-        api: SASAwardAPI = context.bot_data.get("api")
-
-        if not api:
-            raise Exception("API client not initialized")
-
-        # Query SAS API (pass month if specified)
+        # Query SAS API
         logger.info(f"Querying SAS API: {origin} → {destination} (month: {month})")
         data = api.get_availability(origin=origin, destination=destination, month=month or "")
 
@@ -451,8 +616,8 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Update the status message with results
         await status_msg.edit_text(
-            result_message, 
-            parse_mode=ParseMode.HTML, 
+            result_message,
+            parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
             reply_markup=reply_markup
         )
@@ -540,6 +705,167 @@ async def best_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         booking_url = "https://www.sas.no/award-finder"
         message += f'<a href="{booking_url}">🔗 Go to SAS Award Finder</a>'
+
+        await update.message.reply_text(message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    finally:
+        adb.close()
+
+
+async def notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /notify command - subscribe to notifications."""
+    user = update.effective_user
+    chat_id = str(update.effective_chat.id)
+    db_path = context.bot_data.get("db_path", "sas_monitor.db")
+
+    from sas_monitor import AvailabilityDatabase
+    adb = AvailabilityDatabase(db_path)
+
+    try:
+        # Check if already subscribed
+        if adb.is_subscribed(chat_id):
+            await update.message.reply_text(
+                "✅ <b>You're already subscribed!</b>\n\n"
+                "You'll receive instant notifications when:\n"
+                "🎉 New tickets are released\n"
+                "📈 Seats increase\n"
+                "📉 Seats decrease (being booked)\n"
+                "💨 Tickets sell out\n\n"
+                "Use /unsubscribe to stop notifications.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        # Subscribe the user
+        success = adb.add_subscriber(
+            chat_id=chat_id,
+            username=user.username,
+            first_name=user.first_name
+        )
+
+        if success:
+            subscriber_count = adb.get_subscriber_count()
+            await update.message.reply_text(
+                "🔔 <b>Subscribed successfully!</b>\n\n"
+                "You'll now receive instant notifications for:\n"
+                "• 🎉 New ticket releases\n"
+                "• 📈 Seat increases\n"
+                "• 📉 Seat decreases\n"
+                "• 💨 Sold out alerts\n\n"
+                f"Total subscribers: {subscriber_count}\n\n"
+                "Use /unsubscribe anytime to stop notifications.",
+                parse_mode=ParseMode.HTML
+            )
+            logger.info(f"New subscriber: {user.username or chat_id} ({subscriber_count} total)")
+        else:
+            await update.message.reply_text(
+                "❌ Failed to subscribe. Please try again later.",
+                parse_mode=ParseMode.HTML
+            )
+    finally:
+        adb.close()
+
+
+async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /unsubscribe command - unsubscribe from notifications."""
+    user = update.effective_user
+    chat_id = str(update.effective_chat.id)
+    db_path = context.bot_data.get("db_path", "sas_monitor.db")
+
+    from sas_monitor import AvailabilityDatabase
+    adb = AvailabilityDatabase(db_path)
+
+    try:
+        # Check if subscribed
+        if not adb.is_subscribed(chat_id):
+            await update.message.reply_text(
+                "ℹ️ <b>You're not subscribed</b>\n\n"
+                "You're not receiving notifications.\n"
+                "Use /notify to subscribe.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        # Unsubscribe the user
+        success = adb.remove_subscriber(chat_id)
+
+        if success:
+            subscriber_count = adb.get_subscriber_count()
+            await update.message.reply_text(
+                "🔕 <b>Unsubscribed successfully</b>\n\n"
+                "You won't receive any more notifications.\n\n"
+                f"Remaining subscribers: {subscriber_count}\n\n"
+                "You can re-subscribe anytime with /notify",
+                parse_mode=ParseMode.HTML
+            )
+            logger.info(f"User unsubscribed: {user.username or chat_id} ({subscriber_count} remaining)")
+        else:
+            await update.message.reply_text(
+                "❌ Failed to unsubscribe. Please try again later.",
+                parse_mode=ParseMode.HTML
+            )
+    finally:
+        adb.close()
+
+
+async def sales_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /sales command - show fastest-selling tickets history."""
+    db_path = context.bot_data.get("db_path", "sas_monitor.db")
+
+    from sas_monitor import AvailabilityDatabase
+    adb = AvailabilityDatabase(db_path)
+
+    try:
+        fastest = adb.get_fastest_selling_tickets(limit=15)
+
+        if not fastest:
+            await update.message.reply_text(
+                "ℹ️ No sales history available yet.\n\n"
+                "Tickets need to sell out completely to appear here.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        message = "📊 <b>FASTEST SELLING TICKETS</b>\n\n"
+        message += "<i>Tickets that sold out quickest:</i>\n\n"
+
+        for idx, (origin, destination, date, cabin, duration_hours,
+                  max_seats, avg_velocity, sold_out_at) in enumerate(fastest, 1):
+            dest_name = AIRPORT_NAMES.get(destination, destination)
+            class_name = CABIN_CLASSES.get(cabin, {}).get("name", cabin)
+
+            # Format duration
+            if duration_hours < 24:
+                duration_str = f"{duration_hours:.1f} hours"
+            else:
+                days = int(duration_hours / 24)
+                hours = int(duration_hours % 24)
+                duration_str = f"{days}d {hours}h"
+
+            # Determine fire emoji intensity based on velocity
+            if avg_velocity >= 1.5:
+                fire = "🔥🔥🔥"
+            elif avg_velocity >= 1.0:
+                fire = "🔥🔥"
+            elif avg_velocity >= 0.5:
+                fire = "🔥"
+            else:
+                fire = ""
+
+            # Format sold out time
+            try:
+                sold_dt = datetime.strptime(sold_out_at, "%Y-%m-%d %H:%M:%S")
+                sold_display = sold_dt.strftime("%b %d, %H:%M")
+            except:
+                sold_display = sold_out_at
+
+            message += f"{idx}. <b>{origin} → {dest_name}</b> {date}\n"
+            message += f"   💺 {class_name}: {max_seats} seats total\n"
+            message += f"   ⏱️ Sold out in: <b>{duration_str}</b>\n"
+            if avg_velocity > 0:
+                message += f"   ⚡ {avg_velocity:.1f} seats/hour {fire}\n"
+            message += f"   🕐 Sold: {sold_display}\n\n"
+
+        message += "<i>These tickets sold out completely from first discovery.</i>"
 
         await update.message.reply_text(message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     finally:
@@ -635,6 +961,183 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(message, parse_mode=ParseMode.HTML)
     finally:
         adb.close()
+
+
+async def catalogue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handle /catalogue command - browse all tracked tickets with pagination.
+    Default sort: Recent discovery.
+    """
+    db_path = context.bot_data.get("db_path", "sas_monitor.db")
+
+    from sas_monitor import AvailabilityDatabase
+    adb = AvailabilityDatabase(db_path)
+
+    try:
+        # Get all tracked tickets
+        tickets = adb.get_all_tracked_tickets()
+
+        if not tickets:
+            await update.message.reply_text(
+                "ℹ️ No tracked tickets found.\n\n"
+                "The monitor needs to run at least once to populate the catalogue.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        # Sort by first_seen_at descending (most recent first) - default
+        sorted_tickets = sorted(tickets, key=lambda x: x[7], reverse=True)  # x[7] is first_seen_at
+
+        # Build paginated message (page 0)
+        message, keyboard = build_catalogue_page(sorted_tickets, page=0, sort_by="recent")
+
+        await update.message.reply_text(
+            message,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    finally:
+        adb.close()
+
+
+def build_catalogue_page(tickets: list, page: int = 0, sort_by: str = "recent", filter_type: str = "all") -> tuple:
+    """
+    Build a page of the catalogue with navigation buttons.
+
+    Args:
+        tickets: List of ticket tuples from get_all_tracked_tickets()
+        page: Page number (0-indexed)
+        sort_by: Sort method (recent, availability, date, route)
+        filter_type: Filter (all, available, sold_out)
+
+    Returns:
+        Tuple of (message, keyboard)
+    """
+    ITEMS_PER_PAGE = 5  # Routes per page
+
+    # Apply filter
+    if filter_type == "available":
+        filtered_tickets = [t for t in tickets if t[5] > 0]  # currently_available > 0
+    elif filter_type == "sold_out":
+        filtered_tickets = [t for t in tickets if t[5] == 0]  # currently_available == 0
+    else:
+        filtered_tickets = tickets
+
+    # Apply sort
+    if sort_by == "recent":
+        sorted_tickets = sorted(filtered_tickets, key=lambda x: x[7], reverse=True)  # first_seen_at desc
+    elif sort_by == "availability":
+        sorted_tickets = sorted(filtered_tickets, key=lambda x: (x[4], x[5]), reverse=True)  # max_issued, currently_available desc
+    elif sort_by == "date":
+        sorted_tickets = sorted(filtered_tickets, key=lambda x: x[2])  # date asc
+    elif sort_by == "route":
+        sorted_tickets = sorted(filtered_tickets, key=lambda x: (x[0], x[1], x[2]))  # origin, destination, date
+    else:
+        sorted_tickets = filtered_tickets
+
+    # Group by route
+    by_route = {}
+    for ticket in sorted_tickets:
+        route_key = (ticket[0], ticket[1])  # (origin, destination)
+        if route_key not in by_route:
+            by_route[route_key] = []
+        by_route[route_key].append(ticket)
+
+    total_routes = len(by_route)
+    total_pages = max(1, (total_routes + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))  # Clamp page
+
+    # Get routes for this page
+    route_items = list(by_route.items())
+    start_idx = page * ITEMS_PER_PAGE
+    end_idx = min(start_idx + ITEMS_PER_PAGE, total_routes)
+    page_routes = route_items[start_idx:end_idx]
+
+    # Build message header
+    sort_names = {
+        "recent": "Recent Discovery",
+        "availability": "Availability",
+        "date": "Flight Date",
+        "route": "Route"
+    }
+    filter_names = {
+        "all": "All",
+        "available": "Available Only",
+        "sold_out": "Sold Out"
+    }
+
+    message = f"📚 <b>TICKET CATALOGUE</b>\n\n"
+    message += f"Total: {len(filtered_tickets)} tickets across {total_routes} routes\n"
+    message += f"Sort: {sort_names.get(sort_by, sort_by)} | Filter: {filter_names.get(filter_type, filter_type)}\n"
+    message += f"Page {page + 1}/{total_pages}\n\n"
+
+    # Build routes display
+    for (origin, destination), route_tickets in page_routes:
+        dest_name = AIRPORT_NAMES.get(destination, destination)
+        message += f"✈️ <b>{origin} → {dest_name}</b> ({len(route_tickets)} tickets)\n"
+
+        # Group by date
+        by_date = {}
+        for t in route_tickets:
+            if t[2] not in by_date:
+                by_date[t[2]] = []
+            by_date[t[2]].append(t)
+
+        for date in sorted(by_date.keys())[:3]:  # Show max 3 dates per route
+            message += f"  📅 {date}\n"
+            for t in by_date[date]:
+                cabin = t[3]
+                class_name = CABIN_CLASSES.get(cabin, {}).get("name", cabin)
+                emoji = CABIN_CLASSES.get(cabin, {}).get("emoji", "✈️")
+                max_issued = t[4]
+                curr_avail = t[5]
+                total_booked = t[6]
+
+                if curr_avail > 0:
+                    message += f"    {emoji} {class_name}: {curr_avail} avail ({max_issued} total, {total_booked} booked)\n"
+                else:
+                    message += f"    {emoji} {class_name}: SOLD OUT ({max_issued} total)\n"
+
+        message += "\n"
+
+    # Build keyboard
+    keyboard = []
+
+    # Sorting buttons (row 1)
+    sort_row = [
+        InlineKeyboardButton("🕐 Recent" + (" ✓" if sort_by == "recent" else ""),
+                           callback_data=f"cat:0:recent:{filter_type}"),
+        InlineKeyboardButton("💺 Avail" + (" ✓" if sort_by == "availability" else ""),
+                           callback_data=f"cat:0:availability:{filter_type}"),
+        InlineKeyboardButton("📅 Date" + (" ✓" if sort_by == "date" else ""),
+                           callback_data=f"cat:0:date:{filter_type}"),
+    ]
+    keyboard.append(sort_row)
+
+    # Filter buttons (row 2)
+    filter_row = [
+        InlineKeyboardButton("All" + (" ✓" if filter_type == "all" else ""),
+                           callback_data=f"cat:0:{sort_by}:all"),
+        InlineKeyboardButton("Available" + (" ✓" if filter_type == "available" else ""),
+                           callback_data=f"cat:0:{sort_by}:available"),
+        InlineKeyboardButton("Sold Out" + (" ✓" if filter_type == "sold_out" else ""),
+                           callback_data=f"cat:0:{sort_by}:sold_out"),
+    ]
+    keyboard.append(filter_row)
+
+    # Navigation buttons (row 3)
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Previous",
+                                           callback_data=f"cat:{page-1}:{sort_by}:{filter_type}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Next ➡️",
+                                           callback_data=f"cat:{page+1}:{sort_by}:{filter_type}"))
+    if nav_row:
+        keyboard.append(nav_row)
+
+    return message.strip(), keyboard
 
 
 async def tickets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -860,16 +1363,41 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle callback queries from inline keyboard buttons."""
     query = update.callback_query
     await query.answer()  # Acknowledge the callback
-    
+
     data = query.data
     logger.info(f"Callback received: {data}")
-    
+
     # Parse callback data
     parts = data.split(":")
     action = parts[0]
-    
+
     try:
-        if action == "search" and len(parts) == 3:
+        if action == "cat" and len(parts) == 4:
+            # Catalogue pagination/sorting: cat:page:sort:filter
+            page = int(parts[1])
+            sort_by = parts[2]
+            filter_type = parts[3]
+
+            db_path = context.bot_data.get("db_path", "sas_monitor.db")
+            from sas_monitor import AvailabilityDatabase
+            adb = AvailabilityDatabase(db_path)
+
+            try:
+                tickets = adb.get_all_tracked_tickets()
+
+                # Build new page
+                message, keyboard = build_catalogue_page(tickets, page, sort_by, filter_type)
+
+                await query.edit_message_text(
+                    message,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            finally:
+                adb.close()
+
+        elif action == "search" and len(parts) == 3:
             origin, destination = parts[1], parts[2]
             api: SASAwardAPI = context.bot_data.get("api")
             
@@ -1111,11 +1639,15 @@ class SASAwardBot:
         # Register command handlers
         self.application.add_handler(CommandHandler("start", start_command))
         self.application.add_handler(CommandHandler("help", help_command))
+        self.application.add_handler(CommandHandler("notify", notify_command))
+        self.application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
         self.application.add_handler(CommandHandler("search", search_command))
         self.application.add_handler(CommandHandler("history", history_command))
         self.application.add_handler(CommandHandler("best", best_command))
         self.application.add_handler(CommandHandler("calendar", calendar_command))
+        self.application.add_handler(CommandHandler("catalogue", catalogue_command))
         self.application.add_handler(CommandHandler("tickets", tickets_command))
+        self.application.add_handler(CommandHandler("sales", sales_command))
         self.application.add_handler(CommandHandler("velocity", velocity_command))
         self.application.add_handler(CommandHandler("stats", stats_command))
         self.application.add_handler(CommandHandler("status", status_command))
@@ -1135,8 +1667,12 @@ class SASAwardBot:
         """Set bot commands after initialization."""
         commands = [
             ("start", "Welcome message & quick buttons"),
+            ("notify", "Subscribe to notifications"),
+            ("unsubscribe", "Stop receiving notifications"),
             ("search", "Search for availability (OSL BKK)"),
+            ("catalogue", "Browse all tracked tickets"),
             ("tickets", "View tracked tickets (OSL-BKK)"),
+            ("sales", "Fastest selling tickets history"),
             ("velocity", "Hottest tickets (booking fast)"),
             ("calendar", "Calendar view (OSL BKK)"),
             ("history", "Release history (OSL BKK)"),

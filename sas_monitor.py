@@ -266,6 +266,36 @@ class AvailabilityDatabase:
 
             CREATE INDEX IF NOT EXISTS idx_ticket_summary_velocity
             ON ticket_summary(booking_velocity DESC);
+
+            CREATE TABLE IF NOT EXISTS subscribers (
+                chat_id TEXT PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                subscribed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                active INTEGER DEFAULT 1
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_subscribers_active
+            ON subscribers(active);
+
+            CREATE TABLE IF NOT EXISTS ticket_sales_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                origin TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                date TEXT NOT NULL,
+                cabin_class TEXT NOT NULL,
+                first_seen_at TIMESTAMP NOT NULL,
+                sold_out_at TIMESTAMP NOT NULL,
+                duration_hours REAL NOT NULL,
+                max_seats INTEGER NOT NULL,
+                avg_velocity REAL DEFAULT 0.0
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sales_history_duration
+            ON ticket_sales_history(duration_hours ASC);
+
+            CREATE INDEX IF NOT EXISTS idx_sales_history_velocity
+            ON ticket_sales_history(avg_velocity DESC);
         """)
         self.conn.commit()
     
@@ -461,6 +491,100 @@ class AvailabilityDatabase:
         )
         return cursor.fetchall()
 
+    # Subscriber management methods
+    def add_subscriber(self, chat_id: str, username: str = None, first_name: str = None) -> bool:
+        """Add a new subscriber or reactivate existing one."""
+        try:
+            self.conn.execute(
+                """INSERT INTO subscribers (chat_id, username, first_name, active)
+                   VALUES (?, ?, ?, 1)
+                   ON CONFLICT(chat_id) DO UPDATE SET
+                   active=1, subscribed_at=CURRENT_TIMESTAMP""",
+                (chat_id, username, first_name)
+            )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to add subscriber: {e}")
+            return False
+
+    def remove_subscriber(self, chat_id: str) -> bool:
+        """Deactivate a subscriber."""
+        try:
+            self.conn.execute(
+                """UPDATE subscribers SET active=0 WHERE chat_id=?""",
+                (chat_id,)
+            )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to remove subscriber: {e}")
+            return False
+
+    def get_active_subscribers(self) -> list:
+        """Get list of all active subscriber chat IDs."""
+        cursor = self.conn.execute(
+            """SELECT chat_id FROM subscribers WHERE active=1"""
+        )
+        return [row[0] for row in cursor.fetchall()]
+
+    def is_subscribed(self, chat_id: str) -> bool:
+        """Check if a chat_id is subscribed."""
+        cursor = self.conn.execute(
+            """SELECT active FROM subscribers WHERE chat_id=?""",
+            (chat_id,)
+        )
+        row = cursor.fetchone()
+        return row is not None and row[0] == 1
+
+    def get_subscriber_count(self) -> int:
+        """Get count of active subscribers."""
+        cursor = self.conn.execute(
+            """SELECT COUNT(*) FROM subscribers WHERE active=1"""
+        )
+        return cursor.fetchone()[0]
+
+    # Sales history tracking
+    def record_ticket_sold_out(self, origin: str, destination: str, date: str,
+                               cabin_class: str, first_seen_at: str,
+                               max_seats: int, avg_velocity: float):
+        """Record when a ticket sells out completely."""
+        sold_out_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Calculate duration
+        try:
+            first_dt = datetime.strptime(first_seen_at, "%Y-%m-%d %H:%M:%S")
+            sold_dt = datetime.strptime(sold_out_at, "%Y-%m-%d %H:%M:%S")
+            duration_hours = (sold_dt - first_dt).total_seconds() / 3600
+        except:
+            duration_hours = 0.0
+
+        self.conn.execute(
+            """INSERT INTO ticket_sales_history
+               (origin, destination, date, cabin_class, first_seen_at,
+                sold_out_at, duration_hours, max_seats, avg_velocity)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (origin, destination, date, cabin_class, first_seen_at,
+             sold_out_at, duration_hours, max_seats, avg_velocity)
+        )
+        self.conn.commit()
+
+    def get_fastest_selling_tickets(self, limit: int = 15) -> list:
+        """
+        Get tickets that sold out fastest.
+        Returns list of tuples: (origin, destination, date, cabin_class,
+                                 duration_hours, max_seats, avg_velocity, sold_out_at)
+        """
+        cursor = self.conn.execute(
+            """SELECT origin, destination, date, cabin_class,
+                      duration_hours, max_seats, avg_velocity, sold_out_at
+               FROM ticket_sales_history
+               ORDER BY duration_hours ASC
+               LIMIT ?""",
+            (limit,)
+        )
+        return cursor.fetchall()
+
     def get_release_history(self, origin: str, destination: str, limit: int = 20) -> list:
         """
         Get the first-seen time for tickets on a route.
@@ -540,27 +664,32 @@ class AvailabilityDatabase:
 
 class TelegramNotifier:
     """Send notifications via Telegram bot."""
-    
-    def __init__(self, bot_token: str, chat_id: str):
+
+    def __init__(self, bot_token: str, chat_id: str = None):
         self.bot_token = bot_token
-        self.chat_id = chat_id
+        self.chat_id = chat_id  # Legacy single chat_id (optional)
         self.api_url = f"https://api.telegram.org/bot{bot_token}"
-        self.enabled = bool(bot_token and chat_id)
-        
+        self.enabled = bool(bot_token)
+
         if not self.enabled:
-            logger.warning("Telegram notifications disabled (no token/chat_id)")
-    
-    def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
-        """Send a message to the configured chat."""
+            logger.warning("Telegram notifications disabled (no token)")
+
+    def send_message(self, text: str, chat_id: str = None, parse_mode: str = "HTML") -> bool:
+        """Send a message to a specific chat or the configured default chat."""
         if not self.enabled:
             logger.info(f"[DRY RUN] Would send: {text[:100]}...")
             return False
-        
+
+        target_chat_id = chat_id or self.chat_id
+        if not target_chat_id:
+            logger.warning("No chat_id specified for message")
+            return False
+
         try:
             response = requests.post(
                 f"{self.api_url}/sendMessage",
                 json={
-                    "chat_id": self.chat_id,
+                    "chat_id": target_chat_id,
                     "text": text,
                     "parse_mode": parse_mode,
                     "disable_web_page_preview": True,
@@ -568,11 +697,28 @@ class TelegramNotifier:
                 timeout=10
             )
             response.raise_for_status()
-            logger.info("Telegram notification sent")
             return True
         except requests.RequestException as e:
-            logger.error(f"Telegram notification failed: {e}")
+            logger.error(f"Telegram notification failed for chat {target_chat_id}: {e}")
             return False
+
+    def broadcast_message(self, text: str, subscribers: list, parse_mode: str = "HTML") -> int:
+        """
+        Broadcast a message to multiple subscribers.
+        Returns count of successful sends.
+        """
+        if not self.enabled:
+            logger.info(f"[DRY RUN] Would broadcast to {len(subscribers)} subscribers")
+            return 0
+
+        success_count = 0
+        for chat_id in subscribers:
+            if self.send_message(text, chat_id=chat_id, parse_mode=parse_mode):
+                success_count += 1
+                time.sleep(0.05)  # Small delay to avoid rate limits
+
+        logger.info(f"Broadcast sent to {success_count}/{len(subscribers)} subscribers")
+        return success_count
     
     def format_availability_alert(
         self,
@@ -789,7 +935,7 @@ class SASAwardMonitor:
     
     def send_consolidated_notifications(self, changes: dict) -> int:
         """
-        Send consolidated notifications for all changes.
+        Send consolidated notifications for all changes to all subscribers.
         Returns number of notifications sent.
         """
         notifications_sent = 0
@@ -800,6 +946,14 @@ class SASAwardMonitor:
             logger.info("No changes detected - no notifications sent")
             return 0
 
+        # Get all active subscribers
+        subscribers = self.db.get_active_subscribers()
+        if not subscribers:
+            logger.info("No active subscribers - notifications not sent")
+            return 0
+
+        logger.info(f"Broadcasting to {len(subscribers)} subscriber(s)")
+
         # 1. Send NEW TICKETS and INCREASES message (combined)
         if changes['new_tickets'] or changes['seat_increases']:
             msg = self.format_new_tickets_message(
@@ -809,10 +963,11 @@ class SASAwardMonitor:
             msg_hash = hashlib.md5(msg.encode()).hexdigest()
 
             if not self.db.was_recently_notified(msg_hash, hours=24):
-                if self.notifier.send_message(msg):
+                sent_count = self.notifier.broadcast_message(msg, subscribers)
+                if sent_count > 0:
                     self.db.log_notification("", "", "", "", 0, msg, msg_hash)
                     notifications_sent += 1
-                    logger.info(f"Sent new tickets notification ({len(changes['new_tickets'])} new, {len(changes['seat_increases'])} increases)")
+                    logger.info(f"Broadcast new tickets to {sent_count} subscribers ({len(changes['new_tickets'])} new, {len(changes['seat_increases'])} increases)")
 
         # 2. Send DECREASES message
         if changes['seat_decreases']:
@@ -820,21 +975,38 @@ class SASAwardMonitor:
             msg_hash = hashlib.md5(msg.encode()).hexdigest()
 
             if not self.db.was_recently_notified(msg_hash, hours=24):
-                if self.notifier.send_message(msg):
+                sent_count = self.notifier.broadcast_message(msg, subscribers)
+                if sent_count > 0:
                     self.db.log_notification("", "", "", "", 0, msg, msg_hash)
                     notifications_sent += 1
-                    logger.info(f"Sent decreases notification ({len(changes['seat_decreases'])} tickets)")
+                    logger.info(f"Broadcast decreases to {sent_count} subscribers ({len(changes['seat_decreases'])} tickets)")
 
-        # 3. Send VANISHED message
+        # 3. Send VANISHED message (also record in sales history)
         if changes['vanished']:
             msg = self.format_vanished_message(changes['vanished'])
             msg_hash = hashlib.md5(msg.encode()).hexdigest()
 
             if not self.db.was_recently_notified(msg_hash, hours=24):
-                if self.notifier.send_message(msg):
+                sent_count = self.notifier.broadcast_message(msg, subscribers)
+                if sent_count > 0:
                     self.db.log_notification("", "", "", "", 0, msg, msg_hash)
                     notifications_sent += 1
-                    logger.info(f"Sent vanished notification ({len(changes['vanished'])} tickets)")
+                    logger.info(f"Broadcast vanished to {sent_count} subscribers ({len(changes['vanished'])} tickets)")
+
+            # Record sales history for each vanished ticket
+            for ticket in changes['vanished']:
+                summary = self.db.get_ticket_summary(
+                    ticket['origin'], ticket['destination'],
+                    ticket['date'], ticket['cabin']
+                )
+                if summary:
+                    self.db.record_ticket_sold_out(
+                        ticket['origin'], ticket['destination'],
+                        ticket['date'], ticket['cabin'],
+                        summary['first_seen_at'],
+                        summary['max_issued'],
+                        summary.get('booking_velocity', 0.0)
+                    )
 
         return notifications_sent
 
