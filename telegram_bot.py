@@ -271,6 +271,122 @@ def format_origin_search_results(
     return message.strip()
 
 
+def format_reverse_search_results(
+    destination: str,
+    data: List[Dict],
+    month: Optional[str] = None
+) -> str:
+    """
+    Format search results for reverse search (all origins to a destination).
+    Groups results by origin airport.
+    """
+    dest_name = AIRPORT_NAMES.get(destination, destination)
+
+    if not data:
+        return (
+            f"🔍 <b>ALL ORIGINS → {dest_name} ({destination})</b>\n\n"
+            f"❌ No availability data found."
+        )
+
+    # Collect all availability across all origins
+    all_availability = []
+    for dest_data in data:
+        origin = dest_data.get("origin", "")
+        if not origin:
+            continue
+
+        origin_name = AIRPORT_NAMES.get(origin, origin)
+
+        for direction_key in ["outbound", "inbound"]:
+            direction_data = dest_data.get("availability", {}).get(direction_key, [])
+            for avail in direction_data:
+                date = avail.get("date", "")
+                if not date:
+                    continue
+
+                # Get seat counts
+                business = avail.get("AB", 0)
+                premium = avail.get("AP", 0)
+                economy = avail.get("AG", 0)
+
+                # Only include if has availability
+                if business + premium + economy > 0:
+                    all_availability.append({
+                        'origin': origin,
+                        'origin_name': origin_name,
+                        'date': date,
+                        'direction': direction_key,
+                        'business': business,
+                        'premium': premium,
+                        'economy': economy,
+                        # Sort key: prioritize business, then total seats, then date
+                        'sort_key': (
+                            -business,
+                            -(business + premium + economy),
+                            date
+                        )
+                    })
+
+    if not all_availability:
+        return (
+            f"🔍 <b>ALL ORIGINS → {dest_name} ({destination})</b>\n\n"
+            f"ℹ️ No available seats found."
+        )
+
+    # Sort by priority
+    all_availability.sort(key=lambda x: x['sort_key'])
+
+    # Build message
+    message = f"🔍 <b>ALL ORIGINS → {dest_name} ({destination})</b>\n\n"
+    message += f"Found {len(all_availability)} available flights\n"
+    message += f"<i>Sorted by: Business seats → Total seats → Date</i>\n\n"
+
+    # Group by origin for display
+    by_origin = {}
+    for item in all_availability[:50]:
+        orig = item['origin']
+        if orig not in by_origin:
+            by_origin[orig] = {
+                'origin_name': item['origin_name'],
+                'flights': []
+            }
+        by_origin[orig]['flights'].append(item)
+
+    for origin, orig_info in list(by_origin.items())[:10]:
+        message += f"✈️ <b>{orig_info['origin_name']} ({origin})</b>\n"
+
+        for flight in orig_info['flights'][:5]:
+            # Format date
+            try:
+                date_obj = datetime.strptime(flight['date'], "%Y-%m-%d")
+                date_display = date_obj.strftime("%b %d")
+            except:
+                date_display = flight['date']
+
+            direction_emoji = "📤" if flight['direction'] == "outbound" else "📥"
+
+            # Build seat info
+            seat_parts = []
+            if flight['business'] > 0:
+                seat_parts.append(f"💼 Business: {flight['business']}")
+            if flight['premium'] > 0:
+                seat_parts.append(f"⭐ Premium: {flight['premium']}")
+            if flight['economy'] > 0:
+                seat_parts.append(f"💺 Economy: {flight['economy']}")
+
+            message += f"  {direction_emoji} {date_display}: {', '.join(seat_parts)}\n"
+
+        message += "\n"
+
+    if len(by_origin) > 10:
+        message += f"<i>...and {len(by_origin) - 10} more origins</i>\n\n"
+
+    booking_url = f"https://www.sas.no/award-finder?destination={destination}"
+    message += f'<a href="{booking_url}">🔗 Book on SAS</a>'
+
+    return message.strip()
+
+
 def format_search_results(
     origin: str,
     destination: str,
@@ -548,25 +664,16 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     avail_data = api.get_availability(origin=orig, destination=destination, month=month or "")
                     if avail_data:
+                        # Add origin info to the data since API doesn't include it
+                        for item in avail_data:
+                            item['origin'] = orig
                         filtered_data.extend(avail_data)
                 except:
                     # Skip origins that fail
                     pass
 
-            # Format results using origin search formatter (it groups by destination)
-            # But we'll modify the header to show it's a reverse search
-            if not filtered_data:
-                result_message = (
-                    f"🔍 <b>ALL ORIGINS → {dest_name} ({destination})</b>\n\n"
-                    f"❌ No availability found."
-                )
-            else:
-                result_message = format_origin_search_results(None, filtered_data, month)
-                # Replace header
-                result_message = result_message.replace(
-                    "ALL DESTINATIONS",
-                    f"ALL ORIGINS → {dest_name} ({destination})"
-                )
+            # Format results using reverse search formatter
+            result_message = format_reverse_search_results(destination, filtered_data, month)
 
             await status_msg.edit_text(
                 result_message,
