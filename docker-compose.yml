@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  # SAS Award Monitor - checks for new tickets every 15 minutes
+  monitor:
+    build: .
+    container_name: sas-monitor
+    restart: unless-stopped
+    command: python sas_monitor.py --daemon
+    volumes:
+      - ./data:/app/data
+      - ./cookies.txt:/app/cookies.txt:ro
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - DB_PATH=/app/data/sas_monitor.db
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Telegram Bot - interactive commands
+  bot:
+    build: .
+    container_name: sas-telegram-bot
+    restart: unless-stopped
+    command: python telegram_bot.py
+    volumes:
+      - ./data:/app/data
+      - ./cookies.txt:/app/cookies.txt:ro
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - DB_PATH=/app/data/sas_monitor.db
+    depends_on:
+      - monitor
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

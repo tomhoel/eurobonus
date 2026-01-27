@@ -1,0 +1,43 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+monitor.log
+bot.log
+
+# Local database (we use mounted volume)
+sas_monitor.db
+
+# Config (use environment variables instead)
+config.json
+
+# Documentation
+*.md
+!README.md
+
+# Test files
+test_*.py
+
+# Other
+.DS_Store
+Thumbs.db
+systemd/
+.claude/
