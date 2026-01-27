@@ -240,6 +240,17 @@ class AvailabilityDatabase:
                 seats INTEGER NOT NULL,
                 message TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS subscribers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL UNIQUE,
+                username TEXT,
+                first_name TEXT,
+                subscribed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_subscribers_chat_id
+            ON subscribers(chat_id);
         """)
         self.conn.commit()
     
@@ -365,8 +376,54 @@ class AvailabilityDatabase:
         # Notifications sent
         cursor = self.conn.execute("SELECT COUNT(*) FROM notifications")
         stats["notifications_sent"] = cursor.fetchone()[0]
-        
+
+        # Subscriber count
+        cursor = self.conn.execute("SELECT COUNT(*) FROM subscribers")
+        stats["subscriber_count"] = cursor.fetchone()[0]
+
         return stats
+
+    def add_subscriber(self, chat_id: str, username: str = None, first_name: str = None) -> bool:
+        """Add a subscriber. Returns True if newly added, False if already exists."""
+        try:
+            self.conn.execute(
+                """INSERT INTO subscribers (chat_id, username, first_name)
+                   VALUES (?, ?, ?)""",
+                (str(chat_id), username, first_name)
+            )
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def remove_subscriber(self, chat_id: str) -> bool:
+        """Remove a subscriber. Returns True if removed, False if didn't exist."""
+        cursor = self.conn.execute(
+            "DELETE FROM subscribers WHERE chat_id = ?",
+            (str(chat_id),)
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def is_subscribed(self, chat_id: str) -> bool:
+        """Check if a chat_id is subscribed."""
+        cursor = self.conn.execute(
+            "SELECT 1 FROM subscribers WHERE chat_id = ?",
+            (str(chat_id),)
+        )
+        return cursor.fetchone() is not None
+
+    def get_all_subscribers(self) -> list:
+        """Get all subscriber chat_ids."""
+        cursor = self.conn.execute("SELECT chat_id FROM subscribers")
+        return [row[0] for row in cursor.fetchall()]
+
+    def get_subscribers_info(self) -> list:
+        """Get subscriber info for admin display."""
+        cursor = self.conn.execute(
+            "SELECT chat_id, username, first_name, subscribed_at FROM subscribers ORDER BY subscribed_at"
+        )
+        return cursor.fetchall()
 
     def close(self):
         self.conn.close()
@@ -378,27 +435,24 @@ class AvailabilityDatabase:
 
 class TelegramNotifier:
     """Send notifications via Telegram bot."""
-    
-    def __init__(self, bot_token: str, chat_id: str):
+
+    def __init__(self, bot_token: str, chat_id: str, db_path: str = None):
         self.bot_token = bot_token
-        self.chat_id = chat_id
+        self.chat_id = chat_id  # Admin chat_id (always receives notifications)
+        self.db_path = db_path
         self.api_url = f"https://api.telegram.org/bot{bot_token}"
         self.enabled = bool(bot_token and chat_id)
-        
+
         if not self.enabled:
             logger.warning("Telegram notifications disabled (no token/chat_id)")
-    
-    def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
-        """Send a message to the configured chat."""
-        if not self.enabled:
-            logger.info(f"[DRY RUN] Would send: {text[:100]}...")
-            return False
-        
+
+    def _send_to_chat(self, chat_id: str, text: str, parse_mode: str = "HTML") -> bool:
+        """Send a message to a specific chat."""
         try:
             response = requests.post(
                 f"{self.api_url}/sendMessage",
                 json={
-                    "chat_id": self.chat_id,
+                    "chat_id": chat_id,
                     "text": text,
                     "parse_mode": parse_mode,
                     "disable_web_page_preview": True,
@@ -406,11 +460,39 @@ class TelegramNotifier:
                 timeout=10
             )
             response.raise_for_status()
-            logger.info("Telegram notification sent")
             return True
         except requests.RequestException as e:
-            logger.error(f"Telegram notification failed: {e}")
+            logger.error(f"Telegram notification to {chat_id} failed: {e}")
             return False
+
+    def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
+        """Send a message to admin and all subscribers."""
+        if not self.enabled:
+            logger.info(f"[DRY RUN] Would send: {text[:100]}...")
+            return False
+
+        # Collect all recipients: admin + subscribers
+        recipients = set()
+        recipients.add(self.chat_id)  # Admin always gets notifications
+
+        # Get subscribers from database
+        if self.db_path:
+            try:
+                db = AvailabilityDatabase(self.db_path)
+                subscribers = db.get_all_subscribers()
+                recipients.update(subscribers)
+                db.close()
+            except Exception as e:
+                logger.error(f"Failed to get subscribers: {e}")
+
+        # Send to all recipients
+        success_count = 0
+        for chat_id in recipients:
+            if self._send_to_chat(chat_id, text, parse_mode):
+                success_count += 1
+
+        logger.info(f"Telegram notification sent to {success_count}/{len(recipients)} recipients")
+        return success_count > 0
     
     def format_availability_alert(
         self,
@@ -497,7 +579,8 @@ class SASAwardMonitor:
         self.db = AvailabilityDatabase(config.db_path)
         self.notifier = TelegramNotifier(
             config.telegram_bot_token,
-            config.telegram_chat_id
+            config.telegram_chat_id,
+            config.db_path
         )
         self.routes = routes or DEFAULT_ROUTES
         self.baseline_mode = baseline_mode

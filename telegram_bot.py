@@ -288,6 +288,7 @@ I can help you search for award availability on SAS routes.
 /best - Best business availability
 /status - System status
 /scan - Force immediate scan
+/notify - Subscribe to alerts
 /help - Full help
 """
     # Create inline keyboard with popular destinations
@@ -349,6 +350,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /best - Show routes with best business class availability
 /status - System health dashboard
 /scan - Force immediate scan of all monitored routes
+/notify - Subscribe/unsubscribe to alerts
 /help - Show this help message
 
 <b>Examples:</b>
@@ -358,6 +360,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 <code>/best</code>
 <code>/status</code>
 <code>/scan</code>
+<code>/notify</code>
 """
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
@@ -681,6 +684,84 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /notify command - subscribe/unsubscribe to alerts."""
+    from sas_monitor import AvailabilityDatabase
+
+    db_path = context.bot_data.get("db_path", "sas_monitor.db")
+    user = update.effective_user
+    chat_id = str(update.effective_chat.id)
+
+    # Parse argument
+    args = context.args
+    action = args[0].lower() if args else None
+
+    adb = AvailabilityDatabase(db_path)
+    try:
+        is_subscribed = adb.is_subscribed(chat_id)
+
+        if action == "off":
+            # Unsubscribe
+            if adb.remove_subscriber(chat_id):
+                await update.message.reply_text(
+                    "🔕 <b>Unsubscribed!</b>\n\n"
+                    "You will no longer receive award availability alerts.\n"
+                    "Use /notify to subscribe again anytime.",
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await update.message.reply_text(
+                    "ℹ️ You weren't subscribed to notifications.",
+                    parse_mode=ParseMode.HTML
+                )
+
+        elif action == "status":
+            # Check status
+            if is_subscribed:
+                await update.message.reply_text(
+                    "✅ <b>You are subscribed</b> to award availability alerts.\n\n"
+                    "Use /notify off to unsubscribe.",
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ <b>You are not subscribed</b> to notifications.\n\n"
+                    "Use /notify to subscribe.",
+                    parse_mode=ParseMode.HTML
+                )
+
+        elif action in ("on", None):
+            # Subscribe
+            if is_subscribed:
+                await update.message.reply_text(
+                    "✅ You're already subscribed to notifications!\n\n"
+                    "Use /notify off to unsubscribe.",
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                adb.add_subscriber(chat_id, user.username, user.first_name)
+                subscriber_count = adb.get_stats().get("subscriber_count", 1)
+                await update.message.reply_text(
+                    "🔔 <b>Subscribed successfully!</b>\n\n"
+                    "You'll now receive alerts when new SAS EuroBonus award tickets become available.\n\n"
+                    f"👥 You're subscriber #{subscriber_count}\n\n"
+                    "<i>Use /notify off to unsubscribe anytime.</i>",
+                    parse_mode=ParseMode.HTML
+                )
+
+        else:
+            await update.message.reply_text(
+                "📬 <b>Notification Settings</b>\n\n"
+                "<code>/notify</code> - Subscribe to alerts\n"
+                "<code>/notify off</code> - Unsubscribe\n"
+                "<code>/notify status</code> - Check your status",
+                parse_mode=ParseMode.HTML
+            )
+
+    finally:
+        adb.close()
+
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /status command - show system health dashboard."""
     db_path = context.bot_data.get("db_path", "sas_monitor.db")
@@ -707,6 +788,16 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message += f"🛤️ <b>Unique Routes:</b> {stats.get('unique_routes', 0)}\n"
         message += f"📋 <b>Baseline Tickets:</b> {stats.get('baseline_tickets', 0):,}\n"
         message += f"📨 <b>Notifications Sent:</b> {stats.get('notifications_sent', 0)}\n"
+        message += f"👥 <b>Subscribers:</b> {stats.get('subscriber_count', 0)}\n"
+
+        # Show subscriber details
+        subscribers = adb.get_subscribers_info()
+        if subscribers:
+            message += "\n<b>Subscriber List:</b>\n"
+            for chat_id, username, first_name, subscribed_at in subscribers:
+                name = f"@{username}" if username else first_name or "Unknown"
+                message += f"  • {name} (<code>{chat_id}</code>)\n"
+
         message += "\n✅ <i>Monitor is running</i>"
 
         await update.message.reply_text(message, parse_mode=ParseMode.HTML)
@@ -976,6 +1067,7 @@ class SASAwardBot:
         self.application.add_handler(CommandHandler("calendar", calendar_command))
         self.application.add_handler(CommandHandler("status", status_command))
         self.application.add_handler(CommandHandler("scan", scan_command))
+        self.application.add_handler(CommandHandler("notify", notify_command))
 
         # Register callback query handler for inline buttons
         self.application.add_handler(CallbackQueryHandler(callback_handler))
@@ -998,6 +1090,7 @@ class SASAwardBot:
             ("best", "Best Business Class availability"),
             ("status", "System health dashboard"),
             ("scan", "Force immediate scan of all routes"),
+            ("notify", "Subscribe to alerts"),
             ("help", "Show all commands"),
         ]
         await application.bot.set_my_commands(commands)
