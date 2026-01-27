@@ -287,6 +287,7 @@ I can help you search for award availability on SAS routes.
 /calendar OSL BKK - Calendar view
 /best - Best business availability
 /status - System status
+/scan - Force immediate scan
 /help - Full help
 """
     # Create inline keyboard with popular destinations
@@ -347,6 +348,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /history OSL BKK - Show release history for a route
 /best - Show routes with best business class availability
 /status - System health dashboard
+/scan - Force immediate scan of all monitored routes
 /help - Show this help message
 
 <b>Examples:</b>
@@ -355,6 +357,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 <code>/calendar CPH NRT</code>
 <code>/best</code>
 <code>/status</code>
+<code>/scan</code>
 """
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
@@ -614,6 +617,68 @@ async def calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message += "\n"
 
     await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /scan command - force an immediate scan of all monitored routes."""
+    from sas_monitor import SASAwardMonitor, Config, DEFAULT_ROUTES
+    import time
+
+    # Send initial message
+    status_msg = await update.message.reply_text(
+        "🔄 <b>Starting forced scan...</b>\n\n"
+        f"📍 Scanning {len(DEFAULT_ROUTES)} routes\n"
+        "⏳ This may take 1-2 minutes...",
+        parse_mode=ParseMode.HTML
+    )
+
+    try:
+        # Load config from bot_data
+        config = context.bot_data.get("config")
+        if not config:
+            await status_msg.edit_text(
+                "❌ <b>Error:</b> Configuration not loaded.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        # Create monitor instance (not baseline mode - will send notifications)
+        monitor = SASAwardMonitor(config, baseline_mode=False)
+
+        # Run the scan
+        start_time = time.time()
+        total_alerts = monitor.run_once()
+        elapsed = time.time() - start_time
+
+        # Get updated stats
+        from sas_monitor import AvailabilityDatabase
+        adb = AvailabilityDatabase(config.db_path)
+        try:
+            stats = adb.get_stats()
+        finally:
+            adb.close()
+
+        # Format result message
+        result_msg = "✅ <b>Scan Complete!</b>\n\n"
+        result_msg += f"⏱️ <b>Duration:</b> {elapsed:.1f}s\n"
+        result_msg += f"🛤️ <b>Routes Scanned:</b> {len(DEFAULT_ROUTES)}\n"
+        result_msg += f"🔔 <b>New Alerts:</b> {total_alerts}\n"
+        result_msg += f"📁 <b>Total Records:</b> {stats.get('total_records', 0):,}\n"
+        result_msg += f"📋 <b>Baseline Tickets:</b> {stats.get('baseline_tickets', 0):,}\n"
+
+        if total_alerts > 0:
+            result_msg += "\n📬 <i>Notifications have been sent!</i>"
+        else:
+            result_msg += "\n📭 <i>No new availability found.</i>"
+
+        await status_msg.edit_text(result_msg, parse_mode=ParseMode.HTML)
+
+    except Exception as e:
+        logger.error(f"Scan error: {e}")
+        await status_msg.edit_text(
+            f"❌ <b>Scan failed:</b>\n<code>{str(e)}</code>",
+            parse_mode=ParseMode.HTML
+        )
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -897,9 +962,10 @@ class SASAwardBot:
             .build()
         )
 
-        # Store API client in bot_data for handlers to access
+        # Store API client and config in bot_data for handlers to access
         self.application.bot_data["api"] = self.api
         self.application.bot_data["db_path"] = config.db_path
+        self.application.bot_data["config"] = config
 
         # Register command handlers
         self.application.add_handler(CommandHandler("start", start_command))
@@ -909,7 +975,8 @@ class SASAwardBot:
         self.application.add_handler(CommandHandler("best", best_command))
         self.application.add_handler(CommandHandler("calendar", calendar_command))
         self.application.add_handler(CommandHandler("status", status_command))
-        
+        self.application.add_handler(CommandHandler("scan", scan_command))
+
         # Register callback query handler for inline buttons
         self.application.add_handler(CallbackQueryHandler(callback_handler))
 
@@ -930,6 +997,7 @@ class SASAwardBot:
             ("history", "Release history (OSL BKK)"),
             ("best", "Best Business Class availability"),
             ("status", "System health dashboard"),
+            ("scan", "Force immediate scan of all routes"),
             ("help", "Show all commands"),
         ]
         await application.bot.set_my_commands(commands)
