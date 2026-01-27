@@ -603,10 +603,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /search OSL BKK July - Filter by month
 
 <b>📚 Browse Tickets:</b>
-/catalogue - Browse all tracked tickets
-/tickets - View all tracked tickets
-/tickets OSL-BKK - View specific route
-/tickets OSL-BKK 2026-02 - Filter by month
+/catalogue - Browse all tracked tickets with change history
 
 <b>📊 Analytics:</b>
 /sales - Fastest selling tickets
@@ -1163,8 +1160,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def catalogue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handle /catalogue command - browse all tracked tickets with pagination.
-    Default sort: Recent discovery.
+    Handle /catalogue command - browse all tracked tickets with clean format.
+    Shows: current availability, max issued, and recent changes.
     """
     db_path = context.bot_data.get("db_path", "sas_monitor.db")
 
@@ -1172,8 +1169,8 @@ async def catalogue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     adb = AvailabilityDatabase(db_path)
 
     try:
-        # Get all tracked tickets
-        tickets = adb.get_all_tracked_tickets()
+        # Get all tracked tickets with change history
+        tickets = adb.get_route_summary_with_changes()
 
         if not tickets:
             await update.message.reply_text(
@@ -1183,17 +1180,106 @@ async def catalogue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Sort by first_seen_at descending (most recent first) - default
-        sorted_tickets = sorted(tickets, key=lambda x: x[7], reverse=True)  # x[7] is first_seen_at
+        # Group by route, then by date
+        by_route = {}
+        for t in tickets:
+            route_key = (t['origin'], t['destination'])
+            if route_key not in by_route:
+                by_route[route_key] = {}
+            
+            date = t['date']
+            if date not in by_route[route_key]:
+                by_route[route_key][date] = {}
+            
+            by_route[route_key][date][t['cabin_class']] = t
 
-        # Build paginated message (page 0)
-        message, keyboard = build_catalogue_page(sorted_tickets, page=0, sort_by="recent")
+        # Build message with new clean format
+        message = "📚 <b>TICKET CATALOGUE</b>\n\n"
+        
+        route_count = 0
+        for (origin, destination), dates in sorted(by_route.items()):
+            if route_count >= 5:  # Limit to 5 routes
+                break
+            route_count += 1
+            
+            dest_name = AIRPORT_NAMES.get(destination, destination)
+            message += f"✈️ <b>{origin} → {dest_name}</b>\n"
+            
+            date_count = 0
+            for date, cabins in sorted(dates.items()):
+                if date_count >= 3:  # Limit to 3 dates per route
+                    break
+                date_count += 1
+                
+                # Format date nicely
+                try:
+                    date_obj = datetime.strptime(date, "%Y-%m-%d")
+                    date_display = date_obj.strftime("%b %d, %Y")
+                except:
+                    date_display = date
+                
+                message += f"📅 <b>{date_display}</b>\n"
+                
+                # Show each cabin class with clean format
+                for cabin_code in ["AB", "AP", "AG"]:
+                    if cabin_code in cabins:
+                        t = cabins[cabin_code]
+                        emoji = CABIN_CLASSES.get(cabin_code, {}).get("emoji", "✈️")
+                        curr = t['currently_available']
+                        max_seats = t['max_issued']
+                        booked = max_seats - curr
+                        
+                        if curr > 0:
+                            if booked > 0:
+                                message += f"{emoji} {curr:2d} ← {max_seats:2d}  (-{booked} booked)\n"
+                            else:
+                                message += f"{emoji} {curr:2d} ← {max_seats:2d}\n"
+                        else:
+                            message += f"{emoji}  0 ← {max_seats:2d}  (SOLD OUT)\n"
+                
+                # Show recent changes if any
+                all_changes = []
+                for cabin_code, t in cabins.items():
+                    for change in t.get('changes', []):
+                        all_changes.append((change, cabin_code))
+                
+                if all_changes:
+                    # Sort by time (most recent first) and take top 3
+                    all_changes.sort(key=lambda x: x[0][0], reverse=True)
+                    recent = all_changes[:3]
+                    
+                    change_strs = []
+                    for (changed_at, cabin, prev, new, amount, change_type), cabin_code in recent:
+                        emoji = CABIN_CLASSES.get(cabin_code, {}).get("emoji", "")
+                        try:
+                            dt = datetime.strptime(changed_at, "%Y-%m-%d %H:%M:%S")
+                            time_str = dt.strftime("%H:%M")
+                        except:
+                            time_str = changed_at
+                        
+                        if amount < 0:
+                            change_strs.append(f"{amount}{emoji} {time_str}")
+                        else:
+                            change_strs.append(f"+{amount}{emoji} {time_str}")
+                    
+                    if change_strs:
+                        message += f"📉 Recent: {', '.join(change_strs)}\n"
+                
+                message += "\n"
+            
+            message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        
+        # Add remaining routes count
+        remaining = len(by_route) - route_count
+        if remaining > 0:
+            message += f"<i>...and {remaining} more routes</i>\n\n"
+        
+        message += '<a href="https://www.sas.no/award-finder">🔗 Book on SAS</a>'
 
         await update.message.reply_text(
             message,
             parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            disable_web_page_preview=True
         )
     finally:
         adb.close()

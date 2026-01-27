@@ -311,6 +311,25 @@ class AvailabilityDatabase:
 
             CREATE INDEX IF NOT EXISTS idx_ticket_notification
             ON ticket_notification_log(origin, destination, date, cabin_class, notification_type);
+
+            CREATE TABLE IF NOT EXISTS seat_changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                origin TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                date TEXT NOT NULL,
+                cabin_class TEXT NOT NULL,
+                previous_seats INTEGER NOT NULL,
+                new_seats INTEGER NOT NULL,
+                change_amount INTEGER NOT NULL,
+                change_type TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_seat_changes_route
+            ON seat_changes(origin, destination, date, cabin_class);
+
+            CREATE INDEX IF NOT EXISTS idx_seat_changes_time
+            ON seat_changes(changed_at DESC);
         """)
         self.conn.commit()
     
@@ -592,6 +611,97 @@ class AvailabilityDatabase:
             (limit,)
         )
         return cursor.fetchall()
+
+    def log_seat_change(self, origin: str, destination: str, date: str,
+                        cabin_class: str, previous_seats: int, new_seats: int):
+        """Log a seat availability change for history tracking."""
+        change_amount = new_seats - previous_seats
+        if change_amount > 0:
+            change_type = "increase"
+        elif change_amount < 0:
+            change_type = "decrease"
+        else:
+            return  # No change
+        
+        try:
+            self.conn.execute(
+                """INSERT INTO seat_changes 
+                   (origin, destination, date, cabin_class, previous_seats, 
+                    new_seats, change_amount, change_type)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (origin, destination, date, cabin_class, previous_seats, 
+                 new_seats, change_amount, change_type)
+            )
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to log seat change: {e}")
+
+    def get_recent_changes(self, origin: str = None, destination: str = None,
+                           date: str = None, limit: int = 10) -> list:
+        """
+        Get recent seat changes for a route/date.
+        Returns list of tuples: (changed_at, cabin_class, previous_seats, 
+                                 new_seats, change_amount, change_type)
+        """
+        query = """SELECT changed_at, cabin_class, previous_seats, 
+                          new_seats, change_amount, change_type
+                   FROM seat_changes WHERE 1=1"""
+        params = []
+        
+        if origin:
+            query += " AND origin=?"
+            params.append(origin)
+        if destination:
+            query += " AND destination=?"
+            params.append(destination)
+        if date:
+            query += " AND date=?"
+            params.append(date)
+        
+        query += " ORDER BY changed_at DESC LIMIT ?"
+        params.append(limit)
+        
+        cursor = self.conn.execute(query, params)
+        return cursor.fetchall()
+
+    def get_route_summary_with_changes(self, origin: str = None, 
+                                        destination: str = None) -> list:
+        """
+        Get ticket summary grouped by route with recent changes.
+        Returns list of dicts with route info and change history.
+        """
+        # Get summaries
+        query = """SELECT origin, destination, date, cabin_class, max_issued,
+                          currently_available, total_booked, first_seen_at
+                   FROM ticket_summary WHERE 1=1"""
+        params = []
+        
+        if origin:
+            query += " AND origin=?"
+            params.append(origin)
+        if destination:
+            query += " AND destination=?"
+            params.append(destination)
+        
+        query += " ORDER BY origin, destination, date, cabin_class"
+        cursor = self.conn.execute(query, params)
+        
+        results = []
+        for row in cursor.fetchall():
+            ticket = {
+                'origin': row[0],
+                'destination': row[1],
+                'date': row[2],
+                'cabin_class': row[3],
+                'max_issued': row[4],
+                'currently_available': row[5],
+                'total_booked': row[6],
+                'first_seen_at': row[7],
+                'changes': self.get_recent_changes(row[0], row[1], row[2], limit=5)
+            }
+            results.append(ticket)
+        
+        return results
 
     # Subscriber management methods
     def add_subscriber(self, chat_id: str, username: str = None, first_name: str = None) -> bool:
@@ -1016,6 +1126,10 @@ class SASAwardMonitor:
                                     self.db.log_ticket_notification(
                                         origin, destination, date, cabin, 'increase', seats
                                     )
+                                    # Log the change for history
+                                    self.db.log_seat_change(
+                                        origin, destination, date, cabin, prev, seats
+                                    )
                             elif prev is not None and seats < prev:
                                 # Seat decrease (but not gone)
                                 changes['seat_decreases'].append({
@@ -1028,6 +1142,10 @@ class SASAwardMonitor:
                                     'previous_seats': prev,
                                     'direction': direction
                                 })
+                                # Log the change for history
+                                self.db.log_seat_change(
+                                    origin, destination, date, cabin, prev, seats
+                                )
 
                             # Update ticket summary
                             self.db.upsert_ticket_summary(
@@ -1057,6 +1175,10 @@ class SASAwardMonitor:
                                 # Log the notification intent (actual send happens later)
                                 self.db.log_ticket_notification(
                                     origin, destination, date, cabin, 'vanished', prev
+                                )
+                                # Log the change for history
+                                self.db.log_seat_change(
+                                    origin, destination, date, cabin, prev, 0
                                 )
                             else:
                                 logger.info(f"Skipping duplicate vanished notification: {origin}->{destination} {date} {cabin}")
