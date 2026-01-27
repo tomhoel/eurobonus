@@ -251,6 +251,7 @@ class AvailabilityDatabase:
                 destination TEXT NOT NULL,
                 date TEXT NOT NULL,
                 cabin_class TEXT NOT NULL,
+                direction TEXT NOT NULL,
                 max_issued INTEGER NOT NULL,
                 currently_available INTEGER NOT NULL,
                 total_booked INTEGER NOT NULL,
@@ -258,7 +259,7 @@ class AvailabilityDatabase:
                 last_updated_at TIMESTAMP NOT NULL,
                 last_decrease_at TIMESTAMP,
                 booking_velocity REAL DEFAULT 0.0,
-                PRIMARY KEY (origin, destination, date, cabin_class)
+                PRIMARY KEY (origin, destination, date, cabin_class, direction)
             );
 
             CREATE INDEX IF NOT EXISTS idx_ticket_summary_route
@@ -435,15 +436,26 @@ class AvailabilityDatabase:
         return cursor.fetchone()[0]
 
     def get_ticket_summary(self, origin: str, destination: str,
-                          date: str, cabin_class: str) -> Optional[dict]:
-        """Get ticket summary for a specific route/date/cabin."""
-        cursor = self.conn.execute(
-            """SELECT max_issued, currently_available, total_booked,
-                      first_seen_at, last_updated_at, last_decrease_at, booking_velocity
-               FROM ticket_summary
-               WHERE origin=? AND destination=? AND date=? AND cabin_class=?""",
-            (origin, destination, date, cabin_class)
-        )
+                          date: str, cabin_class: str, direction: str = None) -> Optional[dict]:
+        """Get ticket summary for a specific route/date/cabin/direction."""
+        if direction:
+            cursor = self.conn.execute(
+                """SELECT max_issued, currently_available, total_booked,
+                          first_seen_at, last_updated_at, last_decrease_at, booking_velocity
+                   FROM ticket_summary
+                   WHERE origin=? AND destination=? AND date=? AND cabin_class=? AND direction=?""",
+                (origin, destination, date, cabin_class, direction)
+            )
+        else:
+            # Legacy fallback: if no direction specified, try to get any matching record
+            cursor = self.conn.execute(
+                """SELECT max_issued, currently_available, total_booked,
+                          first_seen_at, last_updated_at, last_decrease_at, booking_velocity
+                   FROM ticket_summary
+                   WHERE origin=? AND destination=? AND date=? AND cabin_class=?
+                   LIMIT 1""",
+                (origin, destination, date, cabin_class)
+            )
         row = cursor.fetchone()
         if row:
             return {
@@ -459,7 +471,7 @@ class AvailabilityDatabase:
 
     def upsert_ticket_summary(self, origin: str, destination: str, date: str,
                              cabin_class: str, current_seats: int,
-                             previous_summary: Optional[dict] = None):
+                             previous_summary: Optional[dict] = None, direction: str = "outbound"):
         """Insert or update ticket summary with current availability."""
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -467,11 +479,11 @@ class AvailabilityDatabase:
             # First time seeing this ticket
             self.conn.execute(
                 """INSERT INTO ticket_summary
-                   (origin, destination, date, cabin_class, max_issued,
+                   (origin, destination, date, cabin_class, direction, max_issued,
                     currently_available, total_booked, first_seen_at,
                     last_updated_at, booking_velocity)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (origin, destination, date, cabin_class, current_seats,
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (origin, destination, date, cabin_class, direction, current_seats,
                  current_seats, 0, now, now, 0.0)
             )
         else:
@@ -501,9 +513,9 @@ class AvailabilityDatabase:
                 """UPDATE ticket_summary
                    SET max_issued=?, currently_available=?, total_booked=?,
                        last_updated_at=?, last_decrease_at=?, booking_velocity=?
-                   WHERE origin=? AND destination=? AND date=? AND cabin_class=?""",
+                   WHERE origin=? AND destination=? AND date=? AND cabin_class=? AND direction=?""",
                 (new_max, current_seats, total_booked, now, last_decrease_at,
-                 velocity, origin, destination, date, cabin_class)
+                 velocity, origin, destination, date, cabin_class, direction)
             )
 
         self.conn.commit()
@@ -570,11 +582,11 @@ class AvailabilityDatabase:
                                 month: Optional[str] = None) -> list:
         """
         Get all tracked tickets from ticket_summary table.
-        Returns list of tuples: (origin, destination, date, cabin_class,
+        Returns list of tuples: (origin, destination, date, cabin_class, direction,
                                  max_issued, currently_available, total_booked,
                                  first_seen_at, booking_velocity)
         """
-        query = """SELECT origin, destination, date, cabin_class, max_issued,
+        query = """SELECT origin, destination, date, cabin_class, direction, max_issued,
                           currently_available, total_booked, first_seen_at, booking_velocity
                    FROM ticket_summary
                    WHERE 1=1"""
@@ -590,7 +602,7 @@ class AvailabilityDatabase:
             query += " AND date LIKE ?"
             params.append(f"{month}%")
 
-        query += " ORDER BY origin, destination, date, cabin_class"
+        query += " ORDER BY origin, destination, date, cabin_class, direction"
 
         cursor = self.conn.execute(query, params)
         return cursor.fetchall()
@@ -598,11 +610,11 @@ class AvailabilityDatabase:
     def get_hot_tickets(self, limit: int = 15) -> list:
         """
         Get tickets with highest booking velocity.
-        Returns list of tuples: (origin, destination, date, cabin_class,
+        Returns list of tuples: (origin, destination, date, cabin_class, direction,
                                  currently_available, total_booked, booking_velocity)
         """
         cursor = self.conn.execute(
-            """SELECT origin, destination, date, cabin_class,
+            """SELECT origin, destination, date, cabin_class, direction,
                       currently_available, total_booked, booking_velocity
                FROM ticket_summary
                WHERE booking_velocity > 0 AND currently_available > 0
@@ -664,28 +676,28 @@ class AvailabilityDatabase:
         cursor = self.conn.execute(query, params)
         return cursor.fetchall()
 
-    def get_route_summary_with_changes(self, origin: str = None, 
+    def get_route_summary_with_changes(self, origin: str = None,
                                         destination: str = None) -> list:
         """
         Get ticket summary grouped by route with recent changes.
         Returns list of dicts with route info and change history.
         """
         # Get summaries
-        query = """SELECT origin, destination, date, cabin_class, max_issued,
+        query = """SELECT origin, destination, date, cabin_class, direction, max_issued,
                           currently_available, total_booked, first_seen_at
                    FROM ticket_summary WHERE 1=1"""
         params = []
-        
+
         if origin:
             query += " AND origin=?"
             params.append(origin)
         if destination:
             query += " AND destination=?"
             params.append(destination)
-        
-        query += " ORDER BY origin, destination, date, cabin_class"
+
+        query += " ORDER BY origin, destination, date, cabin_class, direction"
         cursor = self.conn.execute(query, params)
-        
+
         results = []
         for row in cursor.fetchall():
             ticket = {
@@ -693,14 +705,15 @@ class AvailabilityDatabase:
                 'destination': row[1],
                 'date': row[2],
                 'cabin_class': row[3],
-                'max_issued': row[4],
-                'currently_available': row[5],
-                'total_booked': row[6],
-                'first_seen_at': row[7],
+                'direction': row[4],
+                'max_issued': row[5],
+                'currently_available': row[6],
+                'total_booked': row[7],
+                'first_seen_at': row[8],
                 'changes': self.get_recent_changes(row[0], row[1], row[2], limit=5)
             }
             results.append(ticket)
-        
+
         return results
 
     # Subscriber management methods
@@ -1068,7 +1081,7 @@ class SASAwardMonitor:
 
                             # Populate ticket_summary (for analytics/catalogue)
                             self.db.upsert_ticket_summary(
-                                origin, destination, date, cabin, seats, None
+                                origin, destination, date, cabin, seats, None, direction
                             )
 
                             # Store initial availability snapshot
@@ -1087,7 +1100,7 @@ class SASAwardMonitor:
                         )
 
                         # Get ticket summary for historical tracking
-                        summary = self.db.get_ticket_summary(origin, destination, date, cabin)
+                        summary = self.db.get_ticket_summary(origin, destination, date, cabin, direction)
 
                         if seats > 0:
                             # Detect type of change
@@ -1149,7 +1162,7 @@ class SASAwardMonitor:
 
                             # Update ticket summary
                             self.db.upsert_ticket_summary(
-                                origin, destination, date, cabin, seats, summary
+                                origin, destination, date, cabin, seats, summary, direction
                             )
 
                             # Store current availability snapshot
@@ -1185,7 +1198,7 @@ class SASAwardMonitor:
 
                             # Update ticket summary for vanished (always update, even if not notifying)
                             self.db.upsert_ticket_summary(
-                                origin, destination, date, cabin, 0, summary
+                                origin, destination, date, cabin, 0, summary, direction
                             )
 
                             # Store availability snapshot for sold-out state
@@ -1198,9 +1211,9 @@ class SASAwardMonitor:
                             # Seats are 0 but we have a summary (prev might be None due to
                             # availability table being empty). Update summary to reflect sold out.
                             if summary["currently_available"] > 0:
-                                logger.info(f"Correcting stale data: {origin}->{destination} {date} {cabin} was {summary['currently_available']}, now 0")
+                                logger.info(f"Correcting stale data: {origin}->{destination} {date} {cabin} {direction} was {summary['currently_available']}, now 0")
                                 self.db.upsert_ticket_summary(
-                                    origin, destination, date, cabin, 0, summary
+                                    origin, destination, date, cabin, 0, summary, direction
                                 )
                             # Store availability snapshot
                             self.db.store_availability(
@@ -1293,7 +1306,7 @@ class SASAwardMonitor:
             for ticket in changes['vanished']:
                 summary = self.db.get_ticket_summary(
                     ticket['origin'], ticket['destination'],
-                    ticket['date'], ticket['cabin']
+                    ticket['date'], ticket['cabin'], ticket.get('direction', 'outbound')
                 )
                 if summary:
                     self.db.record_ticket_sold_out(
@@ -1383,7 +1396,7 @@ class SASAwardMonitor:
 
                 # Add velocity indicator if available
                 summary = self.db.get_ticket_summary(
-                    t['origin'], t['destination'], t['date'], t['cabin']
+                    t['origin'], t['destination'], t['date'], t['cabin'], t.get('direction', 'outbound')
                 )
                 if summary and summary['booking_velocity'] > 0:
                     velocity = summary['booking_velocity']

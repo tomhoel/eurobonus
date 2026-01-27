@@ -1088,10 +1088,11 @@ async def velocity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = "🔥 <b>HOTTEST TICKETS (Booking Fast!)</b>\n\n"
         message += "<i>Routes with highest booking velocity:</i>\n\n"
 
-        for idx, (origin, destination, date, cabin, curr_avail,
+        for idx, (origin, destination, date, cabin, direction, curr_avail,
                   total_booked, velocity) in enumerate(hot_tickets, 1):
             dest_name = AIRPORT_NAMES.get(destination, destination)
             class_name = CABIN_CLASSES.get(cabin, {}).get("name", cabin)
+            direction_emoji = "→" if direction == "outbound" else "←"
 
             # Determine fire emoji intensity
             if velocity >= 1.5:
@@ -1103,7 +1104,7 @@ async def velocity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 fire = ""
 
-            message += f"{idx}. <b>{origin} → {dest_name}</b> {date}\n"
+            message += f"{idx}. <b>{origin} {direction_emoji} {dest_name}</b> {date}\n"
             message += f"   💺 {class_name}: {curr_avail} left ({total_booked} booked)\n"
             message += f"   ⚡ <b>{velocity:.1f} seats/hour</b> {fire}\n\n"
 
@@ -1143,7 +1144,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Get hot tickets count
         hot_tickets = adb.get_hot_tickets(limit=100)
-        hot_count = len([t for t in hot_tickets if t[6] >= 0.5])  # velocity >= 0.5
+        hot_count = len([t for t in hot_tickets if t[7] >= 0.5])  # velocity >= 0.5 (index 7 now includes direction)
         if hot_count > 0:
             message += f"\n🔥 <b>Hot Tickets:</b> {hot_count} (booking fast)\n"
 
@@ -1180,46 +1181,48 @@ async def catalogue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Group by route, then by date
+        # Group by route, direction, then by date
         by_route = {}
         for t in tickets:
-            route_key = (t['origin'], t['destination'])
+            route_key = (t['origin'], t['destination'], t['direction'])
             if route_key not in by_route:
                 by_route[route_key] = {}
-            
+
             date = t['date']
             if date not in by_route[route_key]:
                 by_route[route_key][date] = {}
-            
+
             by_route[route_key][date][t['cabin_class']] = t
 
         # Build message with new clean format
         message = "📚 <b>TICKET CATALOGUE</b>\n\n"
-        
+
         route_count = 0
-        for (origin, destination), dates in sorted(by_route.items()):
+        for (origin, destination, direction), dates in sorted(by_route.items()):
             if route_count >= 5:  # Limit to 5 routes
                 break
             route_count += 1
-            
+
             dest_name = AIRPORT_NAMES.get(destination, destination)
-            message += f"✈️ <b>{origin} → {dest_name}</b>\n"
-            
+            direction_emoji = "→" if direction == "outbound" else "←"
+            direction_text = f" ({direction})" if direction else ""
+            message += f"✈️ <b>{origin} {direction_emoji} {dest_name}</b>{direction_text}\n"
+
             date_count = 0
             for date, cabins in sorted(dates.items()):
                 if date_count >= 3:  # Limit to 3 dates per route
                     break
                 date_count += 1
-                
+
                 # Format date nicely
                 try:
                     date_obj = datetime.strptime(date, "%Y-%m-%d")
                     date_display = date_obj.strftime("%b %d, %Y")
                 except:
                     date_display = date
-                
+
                 message += f"📅 <b>{date_display}</b>\n"
-                
+
                 # Show each cabin class with clean format
                 for cabin_code in ["AB", "AP", "AG"]:
                     if cabin_code in cabins:
@@ -1228,7 +1231,7 @@ async def catalogue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         curr = t['currently_available']
                         max_seats = t['max_issued']
                         booked = max_seats - curr
-                        
+
                         if curr > 0:
                             if booked > 0:
                                 message += f"{emoji} {curr:2d} ← {max_seats:2d}  (-{booked} booked)\n"
@@ -1300,30 +1303,30 @@ def build_catalogue_page(tickets: list, page: int = 0, sort_by: str = "recent", 
     """
     ITEMS_PER_PAGE = 5  # Routes per page
 
-    # Apply filter
+    # Apply filter - now index 6 is currently_available (after adding direction at index 4)
     if filter_type == "available":
-        filtered_tickets = [t for t in tickets if t[5] > 0]  # currently_available > 0
+        filtered_tickets = [t for t in tickets if t[6] > 0]  # currently_available > 0
     elif filter_type == "sold_out":
-        filtered_tickets = [t for t in tickets if t[5] == 0]  # currently_available == 0
+        filtered_tickets = [t for t in tickets if t[6] == 0]  # currently_available == 0
     else:
         filtered_tickets = tickets
 
-    # Apply sort
+    # Apply sort - indices updated for direction column
     if sort_by == "recent":
-        sorted_tickets = sorted(filtered_tickets, key=lambda x: x[7], reverse=True)  # first_seen_at desc
+        sorted_tickets = sorted(filtered_tickets, key=lambda x: x[8], reverse=True)  # first_seen_at desc
     elif sort_by == "availability":
-        sorted_tickets = sorted(filtered_tickets, key=lambda x: (x[4], x[5]), reverse=True)  # max_issued, currently_available desc
+        sorted_tickets = sorted(filtered_tickets, key=lambda x: (x[5], x[6]), reverse=True)  # max_issued, currently_available desc
     elif sort_by == "date":
         sorted_tickets = sorted(filtered_tickets, key=lambda x: x[2])  # date asc
     elif sort_by == "route":
-        sorted_tickets = sorted(filtered_tickets, key=lambda x: (x[0], x[1], x[2]))  # origin, destination, date
+        sorted_tickets = sorted(filtered_tickets, key=lambda x: (x[0], x[1], x[4], x[2]))  # origin, destination, direction, date
     else:
         sorted_tickets = filtered_tickets
 
-    # Group by route
+    # Group by route and direction
     by_route = {}
     for ticket in sorted_tickets:
-        route_key = (ticket[0], ticket[1])  # (origin, destination)
+        route_key = (ticket[0], ticket[1], ticket[4])  # (origin, destination, direction)
         if route_key not in by_route:
             by_route[route_key] = []
         by_route[route_key].append(ticket)
@@ -1357,9 +1360,10 @@ def build_catalogue_page(tickets: list, page: int = 0, sort_by: str = "recent", 
     message += f"Page {page + 1}/{total_pages}\n\n"
 
     # Build routes display
-    for (origin, destination), route_tickets in page_routes:
+    for (origin, destination, direction), route_tickets in page_routes:
         dest_name = AIRPORT_NAMES.get(destination, destination)
-        message += f"✈️ <b>{origin} → {dest_name}</b> ({len(route_tickets)} tickets)\n"
+        direction_emoji = "→" if direction == "outbound" else "←"
+        message += f"✈️ <b>{origin} {direction_emoji} {dest_name}</b> ({direction}, {len(route_tickets)} tickets)\n"
 
         # Group by date
         by_date = {}
@@ -1374,9 +1378,9 @@ def build_catalogue_page(tickets: list, page: int = 0, sort_by: str = "recent", 
                 cabin = t[3]
                 class_name = CABIN_CLASSES.get(cabin, {}).get("name", cabin)
                 emoji = CABIN_CLASSES.get(cabin, {}).get("emoji", "✈️")
-                max_issued = t[4]
-                curr_avail = t[5]
-                total_booked = t[6]
+                max_issued = t[5]  # Updated index
+                curr_avail = t[6]  # Updated index
+                total_booked = t[7]  # Updated index
 
                 if curr_avail > 0:
                     message += f"    {emoji} {class_name}: {curr_avail} avail ({max_issued} total, {total_booked} booked)\n"
@@ -1578,11 +1582,11 @@ async def tickets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Group by route
+        # Group by route and direction
         by_route = {}
-        for (orig, destination, date, cabin, max_issued, curr_avail,
+        for (orig, destination, date, cabin, direction, max_issued, curr_avail,
              total_booked, first_seen, velocity) in tickets:
-            route_key = (orig, destination)
+            route_key = (orig, destination, direction)
             if route_key not in by_route:
                 by_route[route_key] = []
             by_route[route_key].append({
@@ -1597,9 +1601,10 @@ async def tickets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         message = f"🎫 <b>Tracked Tickets ({len(tickets)} total)</b>\n\n"
 
-        for (orig, destination), route_tickets in sorted(by_route.items())[:10]:  # Limit to 10 routes
+        for (orig, destination, direction), route_tickets in sorted(by_route.items())[:10]:  # Limit to 10 routes
             dest_name = AIRPORT_NAMES.get(destination, destination)
-            message += f"✈️ <b>{orig} → {dest_name}</b>\n\n"
+            direction_emoji = "→" if direction == "outbound" else "←"
+            message += f"✈️ <b>{orig} {direction_emoji} {dest_name}</b> ({direction})\n\n"
 
             # Group by date
             by_date = {}
