@@ -320,9 +320,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
 <b>SAS EuroBonus Award Search Bot</b>
 
-<b>Usage:</b>
-<code>/search ORIGIN DESTINATION</code>
-
 <b>Supported Origins:</b>
 🇳🇴 OSL - Oslo
 🇫🇷 CDG - Paris
@@ -340,21 +337,25 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🇻🇳 HAN - Hanoi
 🇸🇬 SIN - Singapore
 
-<b>Cabin Classes:</b>
-/search OSL BKK - Search for routes
+<b>Commands:</b>
+/search OSL BKK - Search for availability
 /search OSL BKK July - Search with month filter
+/tickets - View all tracked tickets
+/tickets OSL-BKK - View specific route tickets
+/velocity - See hottest tickets (booking fast)
 /calendar OSL BKK - Emoji grid calendar view
-/history OSL BKK - Show release history for a route
-/best - Show routes with best business class availability
+/history OSL BKK - Show release history
+/best - Best business class availability
+/stats - Enhanced statistics dashboard
 /status - System health dashboard
 /help - Show this help message
 
 <b>Examples:</b>
 <code>/search OSL BKK</code>
-<code>/search OSL BKK March</code>
+<code>/tickets OSL-BKK 2026-02</code>
+<code>/velocity</code>
 <code>/calendar CPH NRT</code>
-<code>/best</code>
-<code>/status</code>
+<code>/stats</code>
 """
     await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
@@ -539,6 +540,212 @@ async def best_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         booking_url = "https://www.sas.no/award-finder"
         message += f'<a href="{booking_url}">🔗 Go to SAS Award Finder</a>'
+
+        await update.message.reply_text(message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    finally:
+        adb.close()
+
+
+async def velocity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /velocity command - show hottest tickets (fastest booking)."""
+    db_path = context.bot_data.get("db_path", "sas_monitor.db")
+
+    from sas_monitor import AvailabilityDatabase
+    adb = AvailabilityDatabase(db_path)
+
+    try:
+        hot_tickets = adb.get_hot_tickets(limit=15)
+
+        if not hot_tickets:
+            await update.message.reply_text(
+                "ℹ️ No booking velocity data available yet.\n\n"
+                "Velocity tracking requires at least one seat decrease event.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        message = "🔥 <b>HOTTEST TICKETS (Booking Fast!)</b>\n\n"
+        message += "<i>Routes with highest booking velocity:</i>\n\n"
+
+        for idx, (origin, destination, date, cabin, curr_avail,
+                  total_booked, velocity) in enumerate(hot_tickets, 1):
+            dest_name = AIRPORT_NAMES.get(destination, destination)
+            class_name = CABIN_CLASSES.get(cabin, {}).get("name", cabin)
+
+            # Determine fire emoji intensity
+            if velocity >= 1.5:
+                fire = "🔥🔥🔥"
+            elif velocity >= 1.0:
+                fire = "🔥🔥"
+            elif velocity >= 0.5:
+                fire = "🔥"
+            else:
+                fire = ""
+
+            message += f"{idx}. <b>{origin} → {dest_name}</b> {date}\n"
+            message += f"   💺 {class_name}: {curr_avail} left ({total_booked} booked)\n"
+            message += f"   ⚡ <b>{velocity:.1f} seats/hour</b> {fire}\n\n"
+
+        message += '<a href="https://www.sas.no/award-finder">🔗 Book now on SAS</a>'
+
+        await update.message.reply_text(message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    finally:
+        adb.close()
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /stats command - enhanced status with tracking statistics."""
+    db_path = context.bot_data.get("db_path", "sas_monitor.db")
+
+    from sas_monitor import AvailabilityDatabase
+    adb = AvailabilityDatabase(db_path)
+
+    try:
+        stats = adb.get_stats()
+
+        # Format last scraped time
+        last_scraped = stats.get("last_scraped", "Never")
+        if last_scraped and last_scraped != "Never":
+            try:
+                ls_dt = datetime.strptime(last_scraped, "%Y-%m-%d %H:%M:%S")
+                last_scraped = ls_dt.strftime("%b %d, %H:%M:%S UTC")
+            except:
+                pass
+
+        message = "📊 <b>System Statistics Dashboard</b>\n\n"
+        message += "🕐 <b>Last Scan:</b> " + last_scraped + "\n"
+        message += f"📁 <b>Total Snapshots:</b> {stats.get('total_records', 0):,}\n"
+        message += f"🛤️ <b>Unique Routes:</b> {stats.get('unique_routes', 0)}\n"
+        message += f"🎫 <b>Tracked Tickets:</b> {stats.get('tracked_tickets', 0):,}\n"
+        message += f"📋 <b>Baseline Tickets:</b> {stats.get('baseline_tickets', 0):,}\n"
+        message += f"📨 <b>Notifications Sent:</b> {stats.get('notifications_sent', 0)}\n"
+
+        # Get hot tickets count
+        hot_tickets = adb.get_hot_tickets(limit=100)
+        hot_count = len([t for t in hot_tickets if t[6] >= 0.5])  # velocity >= 0.5
+        if hot_count > 0:
+            message += f"\n🔥 <b>Hot Tickets:</b> {hot_count} (booking fast)\n"
+
+        message += "\n✅ <i>Monitor is running</i>\n"
+        message += "\n<b>Commands:</b>\n"
+        message += "/tickets - View all tracked tickets\n"
+        message += "/velocity - See hottest tickets\n"
+        message += "/best - Best business class availability"
+
+        await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+    finally:
+        adb.close()
+
+
+async def tickets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handle /tickets command - show all tracked tickets with historical max.
+    Usage:
+        /tickets              → All tracked tickets
+        /tickets OSL-BKK      → Specific route
+        /tickets OSL-BKK 2026-02 → Route + month filter
+    """
+    query_text = update.message.text
+    args = query_text.split()[1:]  # Skip command
+
+    origin = dest = month = None
+
+    if len(args) >= 1:
+        parts = args[0].split('-')
+        if len(parts) == 2:
+            origin, dest = parts[0].upper(), parts[1].upper()
+
+    if len(args) >= 2:
+        month = args[1].replace('-', '')  # Convert 2026-02 to 202602
+
+    db_path = context.bot_data.get("db_path", "sas_monitor.db")
+
+    from sas_monitor import AvailabilityDatabase
+    adb = AvailabilityDatabase(db_path)
+
+    try:
+        tickets = adb.get_all_tracked_tickets(origin, dest, month)
+
+        if not tickets:
+            filter_text = ""
+            if origin and dest:
+                filter_text = f" for {origin} → {dest}"
+            if month:
+                filter_text += f" ({month[:4]}-{month[4:]})"
+
+            await update.message.reply_text(
+                f"ℹ️ No tracked tickets found{filter_text}.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        # Group by route
+        by_route = {}
+        for (orig, destination, date, cabin, max_issued, curr_avail,
+             total_booked, first_seen, velocity) in tickets:
+            route_key = (orig, destination)
+            if route_key not in by_route:
+                by_route[route_key] = []
+            by_route[route_key].append({
+                'date': date,
+                'cabin': cabin,
+                'max_issued': max_issued,
+                'currently_available': curr_avail,
+                'total_booked': total_booked,
+                'first_seen': first_seen,
+                'velocity': velocity
+            })
+
+        message = f"🎫 <b>Tracked Tickets ({len(tickets)} total)</b>\n\n"
+
+        for (orig, destination), route_tickets in sorted(by_route.items())[:10]:  # Limit to 10 routes
+            dest_name = AIRPORT_NAMES.get(destination, destination)
+            message += f"✈️ <b>{orig} → {dest_name}</b>\n\n"
+
+            # Group by date
+            by_date = {}
+            for t in route_tickets:
+                if t['date'] not in by_date:
+                    by_date[t['date']] = []
+                by_date[t['date']].append(t)
+
+            for date in sorted(by_date.keys())[:5]:  # Limit to 5 dates per route
+                message += f"📅 <b>{date}</b>\n"
+                for t in by_date[date]:
+                    class_name = CABIN_CLASSES.get(t['cabin'], {}).get("name", t['cabin'])
+                    emoji = CABIN_CLASSES.get(t['cabin'], {}).get("emoji", "✈️")
+
+                    if t['currently_available'] > 0:
+                        message += f"  {emoji} {class_name}: <b>{t['currently_available']}</b> available "
+                        message += f"({t['max_issued']} total, {t['total_booked']} booked)\n"
+
+                        # Add velocity if hot
+                        if t['velocity'] and t['velocity'] > 0.3:
+                            if t['velocity'] >= 1.0:
+                                fire = "🔥🔥"
+                            else:
+                                fire = "🔥"
+                            message += f"     ⚡ {t['velocity']:.1f} seats/hr {fire}\n"
+                    else:
+                        message += f"  {emoji} {class_name}: <b>SOLD OUT</b> "
+                        message += f"({t['max_issued']} total, all booked)\n"
+
+                    # First seen
+                    try:
+                        fs_dt = datetime.strptime(t['first_seen'], "%Y-%m-%d %H:%M:%S")
+                        fs_display = fs_dt.strftime("%b %d, %H:%M")
+                        message += f"     🕐 First seen: {fs_display}\n"
+                    except:
+                        pass
+
+                message += "\n"
+
+            message += "---\n\n"
+
+        if len(by_route) > 10:
+            message += f"<i>Showing 10 of {len(by_route)} routes. Use filters to narrow results.</i>\n\n"
+
+        message += '<a href="https://www.sas.no/award-finder">🔗 Book on SAS</a>'
 
         await update.message.reply_text(message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     finally:
@@ -908,6 +1115,9 @@ class SASAwardBot:
         self.application.add_handler(CommandHandler("history", history_command))
         self.application.add_handler(CommandHandler("best", best_command))
         self.application.add_handler(CommandHandler("calendar", calendar_command))
+        self.application.add_handler(CommandHandler("tickets", tickets_command))
+        self.application.add_handler(CommandHandler("velocity", velocity_command))
+        self.application.add_handler(CommandHandler("stats", stats_command))
         self.application.add_handler(CommandHandler("status", status_command))
         
         # Register callback query handler for inline buttons
@@ -926,9 +1136,12 @@ class SASAwardBot:
         commands = [
             ("start", "Welcome message & quick buttons"),
             ("search", "Search for availability (OSL BKK)"),
+            ("tickets", "View tracked tickets (OSL-BKK)"),
+            ("velocity", "Hottest tickets (booking fast)"),
             ("calendar", "Calendar view (OSL BKK)"),
             ("history", "Release history (OSL BKK)"),
             ("best", "Best Business Class availability"),
+            ("stats", "Enhanced statistics dashboard"),
             ("status", "System health dashboard"),
             ("help", "Show all commands"),
         ]

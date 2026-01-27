@@ -14,12 +14,13 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -238,8 +239,33 @@ class AvailabilityDatabase:
                 date TEXT NOT NULL,
                 cabin_class TEXT NOT NULL,
                 seats INTEGER NOT NULL,
-                message TEXT
+                message TEXT,
+                notification_hash TEXT
             );
+
+            CREATE INDEX IF NOT EXISTS idx_notification_hash
+            ON notifications(notification_hash, sent_at);
+
+            CREATE TABLE IF NOT EXISTS ticket_summary (
+                origin TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                date TEXT NOT NULL,
+                cabin_class TEXT NOT NULL,
+                max_issued INTEGER NOT NULL,
+                currently_available INTEGER NOT NULL,
+                total_booked INTEGER NOT NULL,
+                first_seen_at TIMESTAMP NOT NULL,
+                last_updated_at TIMESTAMP NOT NULL,
+                last_decrease_at TIMESTAMP,
+                booking_velocity REAL DEFAULT 0.0,
+                PRIMARY KEY (origin, destination, date, cabin_class)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_ticket_summary_route
+            ON ticket_summary(origin, destination);
+
+            CREATE INDEX IF NOT EXISTS idx_ticket_summary_velocity
+            ON ticket_summary(booking_velocity DESC);
         """)
         self.conn.commit()
     
@@ -267,15 +293,26 @@ class AvailabilityDatabase:
         return row[0] if row else None
     
     def log_notification(self, origin: str, destination: str, date: str,
-                        cabin_class: str, seats: int, message: str):
-        """Log sent notification."""
+                        cabin_class: str, seats: int, message: str,
+                        notification_hash: str = None):
+        """Log sent notification with optional hash for deduplication."""
         self.conn.execute(
             """INSERT INTO notifications
-               (origin, destination, date, cabin_class, seats, message)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (origin, destination, date, cabin_class, seats, message)
+               (origin, destination, date, cabin_class, seats, message, notification_hash)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (origin, destination, date, cabin_class, seats, message, notification_hash)
         )
         self.conn.commit()
+
+    def was_recently_notified(self, message_hash: str, hours: int = 24) -> bool:
+        """Check if a notification with this hash was sent recently."""
+        cutoff_time = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+        cursor = self.conn.execute(
+            """SELECT COUNT(*) FROM notifications
+               WHERE notification_hash = ? AND sent_at > ?""",
+            (message_hash, cutoff_time)
+        )
+        return cursor.fetchone()[0] > 0
 
     def store_baseline(self, origin: str, destination: str,
                       date: str, cabin_class: str, seats: int):
@@ -302,6 +339,127 @@ class AvailabilityDatabase:
         """Get count of baseline tickets stored."""
         cursor = self.conn.execute("SELECT COUNT(*) FROM known_tickets")
         return cursor.fetchone()[0]
+
+    def get_ticket_summary(self, origin: str, destination: str,
+                          date: str, cabin_class: str) -> Optional[dict]:
+        """Get ticket summary for a specific route/date/cabin."""
+        cursor = self.conn.execute(
+            """SELECT max_issued, currently_available, total_booked,
+                      first_seen_at, last_updated_at, last_decrease_at, booking_velocity
+               FROM ticket_summary
+               WHERE origin=? AND destination=? AND date=? AND cabin_class=?""",
+            (origin, destination, date, cabin_class)
+        )
+        row = cursor.fetchone()
+        if row:
+            return {
+                "max_issued": row[0],
+                "currently_available": row[1],
+                "total_booked": row[2],
+                "first_seen_at": row[3],
+                "last_updated_at": row[4],
+                "last_decrease_at": row[5],
+                "booking_velocity": row[6]
+            }
+        return None
+
+    def upsert_ticket_summary(self, origin: str, destination: str, date: str,
+                             cabin_class: str, current_seats: int,
+                             previous_summary: Optional[dict] = None):
+        """Insert or update ticket summary with current availability."""
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        if previous_summary is None:
+            # First time seeing this ticket
+            self.conn.execute(
+                """INSERT INTO ticket_summary
+                   (origin, destination, date, cabin_class, max_issued,
+                    currently_available, total_booked, first_seen_at,
+                    last_updated_at, booking_velocity)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (origin, destination, date, cabin_class, current_seats,
+                 current_seats, 0, now, now, 0.0)
+            )
+        else:
+            # Update existing
+            new_max = max(previous_summary["max_issued"], current_seats)
+            total_booked = new_max - current_seats
+
+            # Calculate velocity if seats decreased
+            velocity = previous_summary.get("booking_velocity", 0.0)
+            last_decrease_at = previous_summary.get("last_decrease_at")
+
+            if current_seats < previous_summary["currently_available"]:
+                # Seats decreased - calculate booking velocity
+                seats_booked = previous_summary["currently_available"] - current_seats
+                if last_decrease_at:
+                    try:
+                        last_dec_dt = datetime.strptime(last_decrease_at, "%Y-%m-%d %H:%M:%S")
+                        now_dt = datetime.utcnow()
+                        time_diff_hours = (now_dt - last_dec_dt).total_seconds() / 3600
+                        if time_diff_hours > 0:
+                            velocity = seats_booked / time_diff_hours
+                    except:
+                        pass
+                last_decrease_at = now
+
+            self.conn.execute(
+                """UPDATE ticket_summary
+                   SET max_issued=?, currently_available=?, total_booked=?,
+                       last_updated_at=?, last_decrease_at=?, booking_velocity=?
+                   WHERE origin=? AND destination=? AND date=? AND cabin_class=?""",
+                (new_max, current_seats, total_booked, now, last_decrease_at,
+                 velocity, origin, destination, date, cabin_class)
+            )
+
+        self.conn.commit()
+
+    def get_all_tracked_tickets(self, origin: Optional[str] = None,
+                                destination: Optional[str] = None,
+                                month: Optional[str] = None) -> list:
+        """
+        Get all tracked tickets from ticket_summary table.
+        Returns list of tuples: (origin, destination, date, cabin_class,
+                                 max_issued, currently_available, total_booked,
+                                 first_seen_at, booking_velocity)
+        """
+        query = """SELECT origin, destination, date, cabin_class, max_issued,
+                          currently_available, total_booked, first_seen_at, booking_velocity
+                   FROM ticket_summary
+                   WHERE 1=1"""
+        params = []
+
+        if origin:
+            query += " AND origin=?"
+            params.append(origin)
+        if destination:
+            query += " AND destination=?"
+            params.append(destination)
+        if month:
+            query += " AND date LIKE ?"
+            params.append(f"{month}%")
+
+        query += " ORDER BY origin, destination, date, cabin_class"
+
+        cursor = self.conn.execute(query, params)
+        return cursor.fetchall()
+
+    def get_hot_tickets(self, limit: int = 15) -> list:
+        """
+        Get tickets with highest booking velocity.
+        Returns list of tuples: (origin, destination, date, cabin_class,
+                                 currently_available, total_booked, booking_velocity)
+        """
+        cursor = self.conn.execute(
+            """SELECT origin, destination, date, cabin_class,
+                      currently_available, total_booked, booking_velocity
+               FROM ticket_summary
+               WHERE booking_velocity > 0 AND currently_available > 0
+               ORDER BY booking_velocity DESC
+               LIMIT ?""",
+            (limit,)
+        )
+        return cursor.fetchall()
 
     def get_release_history(self, origin: str, destination: str, limit: int = 20) -> list:
         """
@@ -343,29 +501,33 @@ class AvailabilityDatabase:
     def get_stats(self) -> dict:
         """Get database statistics for status dashboard."""
         stats = {}
-        
+
         # Total records
         cursor = self.conn.execute("SELECT COUNT(*) FROM availability")
         stats["total_records"] = cursor.fetchone()[0]
-        
+
         # Last scraped time
         cursor = self.conn.execute("SELECT MAX(scraped_at) FROM availability")
         stats["last_scraped"] = cursor.fetchone()[0]
-        
+
         # Unique routes
         cursor = self.conn.execute(
             "SELECT COUNT(DISTINCT origin || '-' || destination) FROM availability"
         )
         stats["unique_routes"] = cursor.fetchone()[0]
-        
+
         # Baseline count
         cursor = self.conn.execute("SELECT COUNT(*) FROM known_tickets")
         stats["baseline_tickets"] = cursor.fetchone()[0]
-        
+
+        # Tracked tickets count
+        cursor = self.conn.execute("SELECT COUNT(*) FROM ticket_summary")
+        stats["tracked_tickets"] = cursor.fetchone()[0]
+
         # Notifications sent
         cursor = self.conn.execute("SELECT COUNT(*) FROM notifications")
         stats["notifications_sent"] = cursor.fetchone()[0]
-        
+
         return stats
 
     def close(self):
@@ -502,24 +664,35 @@ class SASAwardMonitor:
         self.routes = routes or DEFAULT_ROUTES
         self.baseline_mode = baseline_mode
     
-    def check_route(self, origin: str, destination: str, cabin_classes: list) -> int:
+    def check_route(self, origin: str, destination: str, cabin_classes: list) -> dict:
         """
         Check availability for a specific route.
 
         Returns:
-            Number of alerts triggered (or baseline records stored)
+            Dictionary with changes: {
+                'new_tickets': [...],
+                'seat_increases': [...],
+                'seat_decreases': [...],
+                'vanished': [...]
+            }
         """
         logger.info(f"Checking {origin} → {destination} [{', '.join(cabin_classes)}]")
+
+        changes = {
+            'new_tickets': [],
+            'seat_increases': [],
+            'seat_decreases': [],
+            'vanished': []
+        }
 
         data = self.api.get_availability(origin=origin, destination=destination)
 
         if not data:
             logger.debug(f"No data for {origin} → {destination}")
-            return 0
+            return changes
 
         dest_data = data[0]
         city_name = dest_data.get("cityName", "")
-        alerts = 0
 
         # Process outbound and inbound availability
         for direction in ["outbound", "inbound"]:
@@ -528,90 +701,330 @@ class SASAwardMonitor:
 
                 for cabin in cabin_classes:
                     seats = avail.get(cabin, 0)
-                    if seats > 0:
-                        if self.baseline_mode:
-                            # Baseline mode: store without notification
+
+                    if self.baseline_mode:
+                        # Baseline mode: store without notification
+                        if seats > 0:
                             self.db.store_baseline(origin, destination, date, cabin, seats)
-                            alerts += 1
-                        else:
-                            # Normal mode: check if new or increased
-                            prev = self.db.get_previous_availability(
-                                origin, destination, date, cabin
-                            )
+                    else:
+                        # Normal mode: detect changes
+                        prev = self.db.get_previous_availability(
+                            origin, destination, date, cabin
+                        )
 
-                            # Check if this was in baseline
-                            is_baseline = self.db.is_baseline_ticket(
-                                origin, destination, date, cabin
-                            )
+                        # Check if this was in baseline
+                        is_baseline = self.db.is_baseline_ticket(
+                            origin, destination, date, cabin
+                        )
 
-                            # Alert only on truly new or increased availability
-                            should_alert = False
-                            is_vanishing = False
+                        # Get ticket summary for historical tracking
+                        summary = self.db.get_ticket_summary(origin, destination, date, cabin)
+
+                        if seats > 0:
+                            # Detect type of change
                             if prev is None and not is_baseline:
                                 # Truly new ticket (not in baseline)
-                                should_alert = True
+                                changes['new_tickets'].append({
+                                    'origin': origin,
+                                    'destination': destination,
+                                    'city_name': city_name,
+                                    'date': date,
+                                    'cabin': cabin,
+                                    'seats': seats,
+                                    'direction': direction
+                                })
                             elif prev is not None and seats > prev:
                                 # Seat increase
-                                should_alert = True
-                            elif prev is not None and seats < prev and seats == 0:
-                                # Seat disappearance (only notify when fully gone)
-                                is_vanishing = True
+                                changes['seat_increases'].append({
+                                    'origin': origin,
+                                    'destination': destination,
+                                    'city_name': city_name,
+                                    'date': date,
+                                    'cabin': cabin,
+                                    'seats': seats,
+                                    'previous_seats': prev,
+                                    'direction': direction
+                                })
+                            elif prev is not None and seats < prev:
+                                # Seat decrease (but not gone)
+                                changes['seat_decreases'].append({
+                                    'origin': origin,
+                                    'destination': destination,
+                                    'city_name': city_name,
+                                    'date': date,
+                                    'cabin': cabin,
+                                    'seats': seats,
+                                    'previous_seats': prev,
+                                    'direction': direction
+                                })
 
-                            if should_alert:
-                                discovered_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-                                msg = self.notifier.format_availability_alert(
-                                    origin, destination, date, cabin,
-                                    seats, prev, city_name,
-                                    direction=direction,
-                                    discovered_at=discovered_at
-                                )
-                                if self.notifier.send_message(msg):
-                                    self.db.log_notification(
-                                        origin, destination, date, cabin, seats, msg
-                                    )
-                                alerts += 1
-                            elif is_vanishing:
-                                # Notify on vanishing seats
-                                msg = self.notifier.format_vanishing_alert(
-                                    origin, destination, date, cabin,
-                                    prev, city_name, direction=direction
-                                )
-                                self.notifier.send_message(msg)
-                                alerts += 1
+                            # Update ticket summary
+                            self.db.upsert_ticket_summary(
+                                origin, destination, date, cabin, seats, summary
+                            )
 
-                            # Always store current state
+                            # Store current availability snapshot
                             self.db.store_availability(
                                 origin, destination, date, cabin, seats
                             )
 
-        return alerts
+                        elif prev is not None and prev > 0 and seats == 0:
+                            # Ticket vanished
+                            changes['vanished'].append({
+                                'origin': origin,
+                                'destination': destination,
+                                'city_name': city_name,
+                                'date': date,
+                                'cabin': cabin,
+                                'previous_seats': prev,
+                                'direction': direction
+                            })
+
+                            # Update ticket summary for vanished
+                            self.db.upsert_ticket_summary(
+                                origin, destination, date, cabin, 0, summary
+                            )
+
+        return changes
     
+    def send_consolidated_notifications(self, changes: dict) -> int:
+        """
+        Send consolidated notifications for all changes.
+        Returns number of notifications sent.
+        """
+        notifications_sent = 0
+
+        # Check if anything changed
+        has_changes = any(changes.values())
+        if not has_changes:
+            logger.info("No changes detected - no notifications sent")
+            return 0
+
+        # 1. Send NEW TICKETS and INCREASES message (combined)
+        if changes['new_tickets'] or changes['seat_increases']:
+            msg = self.format_new_tickets_message(
+                changes['new_tickets'],
+                changes['seat_increases']
+            )
+            msg_hash = hashlib.md5(msg.encode()).hexdigest()
+
+            if not self.db.was_recently_notified(msg_hash, hours=24):
+                if self.notifier.send_message(msg):
+                    self.db.log_notification("", "", "", "", 0, msg, msg_hash)
+                    notifications_sent += 1
+                    logger.info(f"Sent new tickets notification ({len(changes['new_tickets'])} new, {len(changes['seat_increases'])} increases)")
+
+        # 2. Send DECREASES message
+        if changes['seat_decreases']:
+            msg = self.format_decreases_message(changes['seat_decreases'])
+            msg_hash = hashlib.md5(msg.encode()).hexdigest()
+
+            if not self.db.was_recently_notified(msg_hash, hours=24):
+                if self.notifier.send_message(msg):
+                    self.db.log_notification("", "", "", "", 0, msg, msg_hash)
+                    notifications_sent += 1
+                    logger.info(f"Sent decreases notification ({len(changes['seat_decreases'])} tickets)")
+
+        # 3. Send VANISHED message
+        if changes['vanished']:
+            msg = self.format_vanished_message(changes['vanished'])
+            msg_hash = hashlib.md5(msg.encode()).hexdigest()
+
+            if not self.db.was_recently_notified(msg_hash, hours=24):
+                if self.notifier.send_message(msg):
+                    self.db.log_notification("", "", "", "", 0, msg, msg_hash)
+                    notifications_sent += 1
+                    logger.info(f"Sent vanished notification ({len(changes['vanished'])} tickets)")
+
+        return notifications_sent
+
+    def format_new_tickets_message(self, new_tickets: list, increases: list) -> str:
+        """Format consolidated message for new tickets and seat increases."""
+        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        # Group by route
+        by_route = {}
+        for ticket in new_tickets + increases:
+            route_key = (ticket['origin'], ticket['destination'], ticket['city_name'])
+            if route_key not in by_route:
+                by_route[route_key] = []
+            by_route[route_key].append(ticket)
+
+        # Count unique routes and total tickets
+        num_routes = len(by_route)
+        num_tickets = len(new_tickets) + len(increases)
+
+        msg = f"🎉 <b>NEW TICKETS FOUND ({num_routes} route(s), {num_tickets} ticket(s))</b>\n\n"
+
+        for (origin, destination, city_name), tickets in sorted(by_route.items()):
+            dest_display = f"{city_name} ({destination})" if city_name else destination
+            msg += f"✈️ <b>{origin} → {dest_display}</b>\n"
+
+            # Group by date
+            by_date = {}
+            for t in tickets:
+                if t['date'] not in by_date:
+                    by_date[t['date']] = []
+                by_date[t['date']].append(t)
+
+            for date in sorted(by_date.keys()):
+                date_tickets = by_date[date]
+                seat_parts = []
+                for t in date_tickets:
+                    class_name = SASAwardAPI.CABIN_CODES.get(t['cabin'], t['cabin'])
+                    if t in increases:
+                        diff = t['seats'] - t['previous_seats']
+                        seat_parts.append(f"{class_name} {t['seats']} (+{diff})")
+                    else:
+                        seat_parts.append(f"{class_name} {t['seats']}")
+
+                msg += f"📅 {date}: {', '.join(seat_parts)}\n"
+
+            msg += "\n"
+
+        msg += f"🕐 Discovered: {timestamp}\n"
+        msg += '<a href="https://www.sas.no/award-finder">🔗 Book now on SAS</a>'
+
+        return msg
+
+    def format_decreases_message(self, decreases: list) -> str:
+        """Format consolidated message for seat decreases."""
+        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        # Group by route
+        by_route = {}
+        for ticket in decreases:
+            route_key = (ticket['origin'], ticket['destination'], ticket['city_name'])
+            if route_key not in by_route:
+                by_route[route_key] = []
+            by_route[route_key].append(ticket)
+
+        num_routes = len(by_route)
+        num_tickets = len(decreases)
+
+        msg = f"📉 <b>SEATS BEING BOOKED ({num_routes} route(s), {num_tickets} ticket(s))</b>\n\n"
+
+        for (origin, destination, city_name), tickets in sorted(by_route.items()):
+            dest_display = f"{city_name} ({destination})" if city_name else destination
+            msg += f"✈️ <b>{origin} → {dest_display}</b>\n"
+
+            for t in sorted(tickets, key=lambda x: x['date']):
+                class_name = SASAwardAPI.CABIN_CODES.get(t['cabin'], t['cabin'])
+                diff = t['previous_seats'] - t['seats']
+                msg += f"📅 {t['date']}: {class_name} {t['previous_seats']}→{t['seats']} (-{diff})\n"
+
+                # Add velocity indicator if available
+                summary = self.db.get_ticket_summary(
+                    t['origin'], t['destination'], t['date'], t['cabin']
+                )
+                if summary and summary['booking_velocity'] > 0:
+                    velocity = summary['booking_velocity']
+                    if velocity >= 1.5:
+                        emoji = "🔥🔥🔥"
+                    elif velocity >= 1.0:
+                        emoji = "🔥🔥"
+                    elif velocity >= 0.5:
+                        emoji = "🔥"
+                    else:
+                        emoji = ""
+                    if emoji:
+                        msg += f"⚡ Velocity: {velocity:.1f} seats/hour {emoji}\n"
+
+            msg += "\n"
+
+        msg += f"🕐 Changes detected: {timestamp}"
+
+        return msg
+
+    def format_vanished_message(self, vanished: list) -> str:
+        """Format consolidated message for vanished tickets."""
+        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        # Group by route
+        by_route = {}
+        for ticket in vanished:
+            route_key = (ticket['origin'], ticket['destination'], ticket['city_name'])
+            if route_key not in by_route:
+                by_route[route_key] = []
+            by_route[route_key].append(ticket)
+
+        num_routes = len(by_route)
+        num_tickets = len(vanished)
+
+        msg = f"💨 <b>TICKETS GONE ({num_routes} route(s), {num_tickets} ticket(s))</b>\n\n"
+
+        for (origin, destination, city_name), tickets in sorted(by_route.items()):
+            dest_display = f"{city_name} ({destination})" if city_name else destination
+            msg += f"✈️ <b>{origin} → {dest_display}</b>\n"
+
+            for t in sorted(tickets, key=lambda x: x['date']):
+                class_name = SASAwardAPI.CABIN_CODES.get(t['cabin'], t['cabin'])
+                msg += f"📅 {t['date']}: {class_name} SOLD OUT\n"
+                msg += f"📊 Was {t['previous_seats']} seat(s) → All booked!\n"
+
+            msg += "\n"
+
+        msg += f"🕐 Gone at: {timestamp}\n"
+        msg += "⚠️ Likely booked by travelers"
+
+        return msg
+
     def run_once(self) -> int:
         """Run a single check of all routes."""
-        total_alerts = 0
         total_routes = len(self.routes)
+
+        if self.baseline_mode:
+            # Baseline mode - just count stored tickets
+            total_stored = 0
+            for idx, route in enumerate(self.routes, 1):
+                try:
+                    logger.info(f"Route {idx}/{total_routes}: {route['origin']} → {route['destination']}")
+                    self.check_route(
+                        route["origin"],
+                        route["destination"],
+                        route["cabin_classes"]
+                    )
+                    time.sleep(self.config.request_delay)
+                except Exception as e:
+                    logger.error(f"Error checking {route}: {e}")
+
+            baseline_count = self.db.get_baseline_count()
+            logger.info(f"Baseline initialization complete.")
+            logger.info(f"Total baseline tickets in database: {baseline_count}")
+            return baseline_count
+
+        # Normal mode - collect all changes
+        all_changes = {
+            'new_tickets': [],
+            'seat_increases': [],
+            'seat_decreases': [],
+            'vanished': []
+        }
 
         for idx, route in enumerate(self.routes, 1):
             try:
                 logger.info(f"Route {idx}/{total_routes}: {route['origin']} → {route['destination']}")
-                alerts = self.check_route(
+                route_changes = self.check_route(
                     route["origin"],
                     route["destination"],
                     route["cabin_classes"]
                 )
-                total_alerts += alerts
+
+                # Collect changes
+                all_changes['new_tickets'].extend(route_changes['new_tickets'])
+                all_changes['seat_increases'].extend(route_changes['seat_increases'])
+                all_changes['seat_decreases'].extend(route_changes['seat_decreases'])
+                all_changes['vanished'].extend(route_changes['vanished'])
+
                 time.sleep(self.config.request_delay)
             except Exception as e:
                 logger.error(f"Error checking {route}: {e}")
 
-        if self.baseline_mode:
-            baseline_count = self.db.get_baseline_count()
-            logger.info(f"Baseline initialization complete. {total_alerts} tickets stored.")
-            logger.info(f"Total baseline tickets in database: {baseline_count}")
-        else:
-            logger.info(f"Check complete. {total_alerts} alerts triggered.")
+        # Send consolidated notifications
+        notifications_sent = self.send_consolidated_notifications(all_changes)
 
-        return total_alerts
+        logger.info(f"Check complete. {notifications_sent} notification(s) sent.")
+        return notifications_sent
     
     def run(self):
         """Main monitoring loop."""
