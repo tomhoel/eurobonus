@@ -849,9 +849,20 @@ class SASAwardMonitor:
                     seats = avail.get(cabin, 0)
 
                     if self.baseline_mode:
-                        # Baseline mode: store without notification
+                        # Baseline mode: store without notification AND populate analytics
                         if seats > 0:
+                            # Store in known_tickets (for change detection)
                             self.db.store_baseline(origin, destination, date, cabin, seats)
+
+                            # Populate ticket_summary (for analytics/catalogue)
+                            self.db.upsert_ticket_summary(
+                                origin, destination, date, cabin, seats, None
+                            )
+
+                            # Store initial availability snapshot
+                            self.db.store_availability(
+                                origin, destination, date, cabin, seats
+                            )
                     else:
                         # Normal mode: detect changes
                         prev = self.db.get_previous_availability(
