@@ -19,6 +19,7 @@ import json
 import logging
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -61,8 +62,8 @@ class Config:
 # Europe to Asia Routes Configuration
 # Origins: Oslo, Paris, Copenhagen, Amsterdam
 # Destinations: Thailand, Japan, China, Vietnam, Singapore
-ORIGINS = ["OSL", "CDG", "CPH", "AMS"]
-DESTINATIONS = [
+EUROPE_AIRPORTS = ["OSL", "CDG", "CPH", "AMS"]
+ASIA_AIRPORTS = [
     "BKK",  # Bangkok, Thailand
     "NRT",  # Tokyo Narita, Japan
     "HND",  # Tokyo Haneda, Japan
@@ -75,12 +76,33 @@ DESTINATIONS = [
 ]
 CABIN_CLASSES = ["AG", "AP", "AB"]  # Economy, Premium, Business
 
-# Generate all 36 route combinations (4 origins × 9 destinations)
-DEFAULT_ROUTES = [
-    {"origin": origin, "destination": dest, "cabin_classes": CABIN_CLASSES}
-    for origin in ORIGINS
-    for dest in DESTINATIONS
-]
+# Legacy aliases for backwards compatibility
+ORIGINS = EUROPE_AIRPORTS
+DESTINATIONS = ASIA_AIRPORTS
+
+# Generate all route combinations (both directions)
+# Europe → Asia (36 routes) + Asia → Europe (36 routes) = 72 routes
+DEFAULT_ROUTES = []
+
+# Europe → Asia (outbound)
+for origin in EUROPE_AIRPORTS:
+    for dest in ASIA_AIRPORTS:
+        DEFAULT_ROUTES.append({
+            "origin": origin,
+            "destination": dest,
+            "cabin_classes": CABIN_CLASSES,
+            "direction": "outbound"
+        })
+
+# Asia → Europe (return)
+for origin in ASIA_AIRPORTS:
+    for dest in EUROPE_AIRPORTS:
+        DEFAULT_ROUTES.append({
+            "origin": origin, 
+            "destination": dest,
+            "cabin_classes": CABIN_CLASSES,
+            "direction": "return"
+        })
 
 
 # ============================================================================
@@ -1475,12 +1497,19 @@ class SASAwardMonitor:
 
         return msg
 
-    def run_once(self) -> int:
-        """Run a single check of all routes."""
+    def run_once(self, parallel: bool = True, max_workers: int = 4) -> int:
+        """
+        Run a single check of all routes.
+        
+        Args:
+            parallel: If True, use parallel queries (faster)
+            max_workers: Number of concurrent API requests
+        """
         total_routes = len(self.routes)
+        start_time = time.time()
 
         if self.baseline_mode:
-            # Baseline mode - just count stored tickets
+            # Baseline mode - sequential to avoid rate limiting
             total_stored = 0
             for idx, route in enumerate(self.routes, 1):
                 try:
@@ -1507,39 +1536,82 @@ class SASAwardMonitor:
             'vanished': []
         }
 
-        for idx, route in enumerate(self.routes, 1):
+        def check_single_route(route_info):
+            """Worker function for parallel execution."""
+            idx, route = route_info
             try:
-                logger.info(f"Route {idx}/{total_routes}: {route['origin']} → {route['destination']}")
-                route_changes = self.check_route(
+                return self.check_route(
                     route["origin"],
                     route["destination"],
                     route["cabin_classes"]
                 )
-
-                # Collect changes
-                all_changes['new_tickets'].extend(route_changes['new_tickets'])
-                all_changes['seat_increases'].extend(route_changes['seat_increases'])
-                all_changes['seat_decreases'].extend(route_changes['seat_decreases'])
-                all_changes['vanished'].extend(route_changes['vanished'])
-
-                time.sleep(self.config.request_delay)
             except Exception as e:
-                logger.error(f"Error checking {route}: {e}")
+                logger.error(f"Error checking {route['origin']}→{route['destination']}: {e}")
+                return {'new_tickets': [], 'seat_increases': [], 
+                        'seat_decreases': [], 'vanished': []}
+
+        if parallel and total_routes > 1:
+            # Parallel execution
+            logger.info(f"Checking {total_routes} routes in parallel (workers={max_workers})...")
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all routes
+                futures = {
+                    executor.submit(check_single_route, (idx, route)): route
+                    for idx, route in enumerate(self.routes, 1)
+                }
+                
+                # Collect results as they complete
+                completed = 0
+                for future in as_completed(futures):
+                    route = futures[future]
+                    completed += 1
+                    try:
+                        route_changes = future.result()
+                        all_changes['new_tickets'].extend(route_changes['new_tickets'])
+                        all_changes['seat_increases'].extend(route_changes['seat_increases'])
+                        all_changes['seat_decreases'].extend(route_changes['seat_decreases'])
+                        all_changes['vanished'].extend(route_changes['vanished'])
+                        
+                        if completed % 10 == 0:
+                            logger.info(f"Progress: {completed}/{total_routes} routes checked")
+                    except Exception as e:
+                        logger.error(f"Error processing {route}: {e}")
+        else:
+            # Sequential execution (for baseline or single route)
+            for idx, route in enumerate(self.routes, 1):
+                try:
+                    logger.info(f"Route {idx}/{total_routes}: {route['origin']} → {route['destination']}")
+                    route_changes = self.check_route(
+                        route["origin"],
+                        route["destination"],
+                        route["cabin_classes"]
+                    )
+
+                    # Collect changes
+                    all_changes['new_tickets'].extend(route_changes['new_tickets'])
+                    all_changes['seat_increases'].extend(route_changes['seat_increases'])
+                    all_changes['seat_decreases'].extend(route_changes['seat_decreases'])
+                    all_changes['vanished'].extend(route_changes['vanished'])
+
+                    time.sleep(self.config.request_delay)
+                except Exception as e:
+                    logger.error(f"Error checking {route}: {e}")
 
         # Send consolidated notifications
         notifications_sent = self.send_consolidated_notifications(all_changes)
 
+        elapsed = time.time() - start_time
         logger.info(f"Check complete. {notifications_sent} notification(s) sent.")
+        logger.info(f"Check completed in {elapsed:.1f}s")
         return notifications_sent
     
     def run(self):
         """Main monitoring loop."""
         logger.info(f"Starting SAS Award Monitor")
-        logger.info(f"Monitoring {len(self.routes)} Europe→Asia routes")
+        logger.info(f"Monitoring {len(self.routes)} routes (Europe↔Asia bidirectional)")
         logger.info(f"Poll interval: {self.config.poll_interval}s")
-
-        expected_duration = len(self.routes) * self.config.request_delay
-        logger.info(f"Expected check duration: ~{expected_duration:.0f}s ({expected_duration/60:.1f} min)")
+        logger.info(f"Parallel queries enabled (4 workers)")
 
         while True:
             try:
