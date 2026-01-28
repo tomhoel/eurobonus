@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 # Import SAS API from the monitor
-from sas_monitor import SASAwardAPI, Config, DESTINATIONS, ORIGINS
+from sas_monitor import SASAwardAPI, Config, DESTINATIONS, ORIGINS, EUROPE_AIRPORTS, ASIA_AIRPORTS
 
 # ============================================================================
 # Configuration
@@ -710,19 +710,29 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Check if origin-only query
     if destination is None:
-        # Origin-only search - query only tracked destinations
+        # Origin-only search - detect if origin is European or Asian
+        # and query the opposite region as destinations
+        if origin in ASIA_AIRPORTS:
+            # Asian origin - query European destinations (return flights)
+            search_destinations = EUROPE_AIRPORTS
+            direction_label = "EUROPE"
+        else:
+            # European origin - query Asian destinations (outbound flights)
+            search_destinations = ASIA_AIRPORTS
+            direction_label = "ASIA"
+        
         month_text = f" ({month[:4]}-{month[4:]})" if month else ""
         status_msg = await update.message.reply_text(
-            f"🔍 Searching {origin} → TRACKED DESTINATIONS{month_text}...",
+            f"🔍 Searching {origin} → {direction_label}{month_text}...",
             parse_mode=ParseMode.HTML
         )
 
         try:
-            logger.info(f"Querying SAS API for tracked destinations from {origin}")
+            logger.info(f"Querying SAS API for {direction_label} destinations from {origin}")
 
-            # Query only tracked DESTINATIONS (not all airports)
+            # Query appropriate destinations
             filtered_data = []
-            for dest in DESTINATIONS:
+            for dest in search_destinations:
                 try:
                     avail_data = api.get_availability(origin=origin, destination=dest, month=month or "")
                     if avail_data:
