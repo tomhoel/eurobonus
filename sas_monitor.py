@@ -517,9 +517,9 @@ class AvailabilityDatabase:
         
         try:
             if previous_summary is None:
-                # First time seeing this ticket
+                # First time seeing this ticket - use INSERT OR IGNORE then UPDATE
                 cursor.execute(
-                    """INSERT INTO ticket_summary
+                    """INSERT OR IGNORE INTO ticket_summary
                        (origin, destination, date, cabin_class, direction, max_issued,
                         currently_available, total_booked, first_seen_at,
                         last_updated_at, booking_velocity)
@@ -527,6 +527,19 @@ class AvailabilityDatabase:
                     (origin, destination, date, cabin_class, direction, current_seats,
                      current_seats, 0, now, now, 0.0)
                 )
+                # If rows affected is 0, the record already exists - update it
+                if cursor.rowcount == 0:
+                    cursor.execute(
+                        """UPDATE ticket_summary
+                           SET max_issued = MAX(max_issued, ?),
+                               currently_available = ?,
+                               total_booked = MAX(max_issued, ?) - ?,
+                               last_updated_at = ?
+                           WHERE origin=? AND destination=? AND date=? 
+                           AND cabin_class=? AND direction=?""",
+                        (current_seats, current_seats, current_seats, current_seats, now,
+                         origin, destination, date, cabin_class, direction)
+                    )
             else:
                 # Update existing
                 new_max = max(previous_summary["max_issued"], current_seats)
