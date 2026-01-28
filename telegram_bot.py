@@ -1223,7 +1223,10 @@ async def catalogue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 message += f"📅 <b>{date_display}</b>\n"
 
-                # Show each cabin class with clean format
+                # Collect cabin info for this date
+                cabin_parts = []
+                has_bookings = False
+                
                 for cabin_code in ["AB", "AP", "AG"]:
                     if cabin_code in cabins:
                         t = cabins[cabin_code]
@@ -1231,25 +1234,33 @@ async def catalogue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         curr = t['currently_available']
                         max_seats = t['max_issued']
                         booked = max_seats - curr
-
-                        if curr > 0:
-                            if booked > 0:
-                                message += f"{emoji} {curr:2d} ← {max_seats:2d}  (-{booked} booked)\n"
-                            else:
-                                message += f"{emoji} {curr:2d} ← {max_seats:2d}\n"
+                        
+                        if curr == 0 and max_seats > 0:
+                            # Sold out
+                            cabin_parts.append(f"  {emoji} 0/{max_seats} ❌")
+                            has_bookings = True
+                        elif booked > 0:
+                            # Some booked
+                            cabin_parts.append(f"  {emoji} {curr}/{max_seats} (-{booked})")
+                            has_bookings = True
                         else:
-                            message += f"{emoji}  0 ← {max_seats:2d}  (SOLD OUT)\n"
+                            # No bookings yet - simple format
+                            cabin_parts.append(f"  {emoji} {curr}")
                 
-                # Show recent changes if any
-                all_changes = []
+                message += "\n".join(cabin_parts) + "\n"
+                
+                # Show recent DECREASES only (filter out positive baseline changes)
+                all_decreases = []
                 for cabin_code, t in cabins.items():
                     for change in t.get('changes', []):
-                        all_changes.append((change, cabin_code))
+                        # change = (changed_at, cabin, prev, new, amount, change_type)
+                        if change[4] < 0:  # Only negative changes (bookings)
+                            all_decreases.append((change, cabin_code))
                 
-                if all_changes:
+                if all_decreases:
                     # Sort by time (most recent first) and take top 3
-                    all_changes.sort(key=lambda x: x[0][0], reverse=True)
-                    recent = all_changes[:3]
+                    all_decreases.sort(key=lambda x: x[0][0], reverse=True)
+                    recent = all_decreases[:3]
                     
                     change_strs = []
                     for (changed_at, cabin, prev, new, amount, change_type), cabin_code in recent:
@@ -1260,13 +1271,10 @@ async def catalogue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         except:
                             time_str = changed_at
                         
-                        if amount < 0:
-                            change_strs.append(f"{amount}{emoji} {time_str}")
-                        else:
-                            change_strs.append(f"+{amount}{emoji} {time_str}")
+                        change_strs.append(f"{amount}{emoji} {time_str}")
                     
                     if change_strs:
-                        message += f"📉 Recent: {', '.join(change_strs)}\n"
+                        message += f"  📉 {', '.join(change_strs)}\n"
                 
                 message += "\n"
             
