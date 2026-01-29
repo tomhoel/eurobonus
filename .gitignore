@@ -29,3 +29,15 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# Secrets
+.env
+sas_session.json
+cookies.txt
+
+# Data & Responses
+*.json
+!sas_route_map.json
+availability_alerts.txt
+*.html
+*.webp
