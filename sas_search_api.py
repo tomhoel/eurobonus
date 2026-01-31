@@ -57,6 +57,10 @@ class FlightSegment:
     arrival_date: str           # YYYY-MM-DD
     aircraft: str               # e.g., "359" (Airbus A350)
     duration_minutes: int       # Flight duration
+    departure_terminal: str = "" # e.g., "3"
+    arrival_terminal: str = ""   # e.g., "M"
+    distance_miles: int = 0      # Distance in miles
+    carrier_name: str = ""       # e.g., "SAS"
     
     @property
     def formatted_departure(self) -> str:
@@ -84,6 +88,13 @@ class FlightOffer:
     total_duration_minutes: int = 0  # Total journey time
     stops: int = 0              # Number of stops (0 = direct)
     flight_id: str = ""         # Unique flight identifier
+    product_type: str = ""      # e.g., "ECONOMY BONUS", "STANDARD"
+    is_saver_award: bool = False # True if this is a standard award ticket
+    fare_class: str = ""        # Booking class (e.g., "X", "I", "T")
+    cash_price: float = 0.0     # Total cash price in local currency
+    base_price: float = 0.0     # Base price (excluding taxes)
+    lowest_fare: bool = False   # Flag if this is the lowest fare in cabin
+    sas_recommended: bool = False # Flag if SAS recommends this flight
     
     @property
     def is_direct(self) -> bool:
@@ -95,8 +106,9 @@ class FlightOffer:
     
     def __repr__(self) -> str:
         stops_str = "direct" if self.is_direct else f"{self.stops} stop(s)"
-        return (f"FlightOffer({self.origin}→{self.destination} {self.date}, "
-                f"{self.cabin_class}: {self.points:,} pts + {self.taxes:.0f} {self.currency}, "
+        award_tag = "[AWARD] " if self.is_saver_award else ""
+        return (f"FlightOffer({award_tag}{self.origin}→{self.destination} {self.date}, "
+                f"{self.cabin_class} ({self.product_name}): {self.points:,} pts + {self.taxes:.0f} {self.currency}, "
                 f"{stops_str})")
 
 
@@ -110,7 +122,7 @@ class AvailabilityDate:
     
     @property
     def has_availability(self) -> bool:
-        return self.economy_seats > 0 or self.premium_seats > 0 or self.business_seats > 0
+        return (int(self.economy_seats or 0) + int(self.premium_seats or 0) + int(self.business_seats or 0)) > 0
     
     def get_seats(self, cabin: str) -> int:
         """Get seats for cabin code (AG, AP, AB) or name."""
@@ -567,9 +579,9 @@ class SASSearchEngine:
                 for day in availability.get("outbound", []):
                     dates.append(AvailabilityDate(
                         date=day.get("date", ""),
-                        economy_seats=day.get("AG", 0),
-                        premium_seats=day.get("AP", 0),
-                        business_seats=day.get("AB", 0)
+                        economy_seats=int(day.get("AG", 0) or 0),
+                        premium_seats=int(day.get("AP", 0) or 0),
+                        business_seats=int(day.get("AB", 0) or 0)
                     ))
         
         return dates
@@ -641,24 +653,66 @@ class SASSearchEngine:
         # Normalize date format
         if len(date) == 8:  # YYYYMMDD
             date = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
-        
+            
+        if not isinstance(data, dict):
+            return []
+            
         outbound_flights = data.get("outboundFlights", {})
+        if not isinstance(outbound_flights, dict):
+            # Handle list case if it's a list (some endpoints might return a list)
+            if isinstance(outbound_flights, list):
+                outbound_flights = {str(i): f for i, f in enumerate(outbound_flights)}
+            else:
+                return []
         
         for flight_key, flight_data in outbound_flights.items():
+            if not isinstance(flight_data, dict):
+                continue
+            
             # Parse segments
             segments = []
-            for seg in flight_data.get("segments", []):
+            segs_raw = flight_data.get("segments", [])
+            for seg in segs_raw:
+                if not isinstance(seg, dict):
+                    continue
+                # Parse duration (can be int minutes or "HH:MM:SS" string)
+                duration_raw = seg.get("duration", 0)
+                if isinstance(duration_raw, str) and ":" in duration_raw:
+                    parts = duration_raw.split(":")
+                    duration_mins = int(parts[0]) * 60 + int(parts[1])
+                else:
+                    duration_mins = int(duration_raw or 0)
+
+                # Extract airport codes
+                dep_air = seg.get("departureAirport", "")
+                if isinstance(dep_air, dict): dep_air = dep_air.get("code", "")
+                
+                arr_air = seg.get("arrivalAirport", "")
+                if isinstance(arr_air, dict): arr_air = arr_air.get("code", "")
+                
+                # Extract aircraft details
+                ac_raw = seg.get("airCraft", {})
+                ac_name = ac_raw.get("name", "") if isinstance(ac_raw, dict) else self._get_aircraft_name(str(ac_raw))
+                
+                # Extract carrier details
+                mc_raw = seg.get("marketingCarrier", {})
+                mc_name = mc_raw.get("name", "") if isinstance(mc_raw, dict) else ""
+
                 segments.append(FlightSegment(
                     flight_number=seg.get("flightNumber", ""),
-                    carrier=seg.get("carrier", ""),
-                    departure_airport=seg.get("departureAirport", ""),
-                    arrival_airport=seg.get("arrivalAirport", ""),
+                    carrier=seg.get("carrier", {}).get("code", "") if isinstance(seg.get("carrier"), dict) else seg.get("carrier", ""),
+                    departure_airport=dep_air,
+                    arrival_airport=arr_air,
                     departure_time=seg.get("departureTime", ""),
                     arrival_time=seg.get("arrivalTime", ""),
                     departure_date=seg.get("departureDate", date),
                     arrival_date=seg.get("arrivalDate", date),
-                    aircraft=self._get_aircraft_name(seg.get("aircraft", "")),
-                    duration_minutes=seg.get("duration", 0)
+                    aircraft=ac_name,
+                    duration_minutes=duration_mins,
+                    departure_terminal=seg.get("departureTerminal", ""),
+                    arrival_terminal=seg.get("arrivalTerminal", ""),
+                    distance_miles=int(seg.get("miles", 0) or 0),
+                    carrier_name=mc_name
                 ))
             
             # Calculate total duration and stops
@@ -666,17 +720,60 @@ class SASSearchEngine:
             stops = len(segments) - 1 if segments else 0
             
             # Parse cabins and products
-            for cabin_data in flight_data.get("cabins", []):
-                cabin_class = cabin_data.get("cabinClass", "ECONOMY")
+            cabins_raw = flight_data.get("cabins", {})
+            
+            # If it's a dict, we iterate over items. If it's a list, we iterate over items.
+            cabin_items = cabins_raw.items() if isinstance(cabins_raw, dict) else enumerate(cabins_raw)
+            
+            for cabin_key, cabin_val in cabin_items:
+                # If it was a dict, cabin_key is "ECONOMY" etc. If list, it's index.
+                if isinstance(cabin_val, dict):
+                    cabin_class = cabin_val.get("cabinClass", str(cabin_key))
+                all_products = []
                 
-                for product in cabin_data.get("products", []):
+                # Check 1: Standard structure
+                if isinstance(cabin_val, dict) and "products" in cabin_val:
+                    raw = cabin_val["products"]
+                    if isinstance(raw, list):
+                        all_products.extend(raw)
+                    elif isinstance(raw, dict):
+                         all_products.extend(raw.values())
+                
+                # Check 2: Upsell structure (deeply nested products or direct products)
+                elif isinstance(cabin_val, dict):
+                    for sub_val in cabin_val.values():
+                        if isinstance(sub_val, dict):
+                            if "products" in sub_val:
+                                sub_raw = sub_val["products"]
+                                if isinstance(sub_raw, list):
+                                    all_products.extend(sub_raw)
+                                elif isinstance(sub_raw, dict):
+                                    all_products.extend(sub_raw.values())
+                            else:
+                                # Start assuming sub_val IS the product
+                                all_products.append(sub_val)
+
+                for product in all_products:
+                    if not isinstance(product, dict):
+                        continue
+                    
                     price_info = product.get("price", {})
+                    
                     fares = product.get("fares", [{}])
                     first_fare = fares[0] if fares else {}
                     
                     points = price_info.get("points", 0)
                     if not points:
-                        continue  # Skip if no points price
+                        # Fallback for upsell mode? upsell mode should have points if bookingFlow=points
+                        # In upsell JSON from earlier debug: "points": 60476 is directly in price dict.
+                        pass
+                        
+                    if not points:
+                         # Extra check
+                         continue
+                    
+                    is_saver = product.get("isStandardAward", False)
+                    prod_type = product.get("productType", "")
                     
                     offers.append(FlightOffer(
                         origin=origin,
@@ -684,15 +781,22 @@ class SASSearchEngine:
                         date=date,
                         cabin_class=cabin_class,
                         product_name=product.get("productName", ""),
-                        points=points,
-                        taxes=price_info.get("totalTax", 0),
+                        points=int(price_info.get("points", 0) or 0),
+                        taxes=float(price_info.get("totalTax", 0) or 0),
                         currency=price_info.get("currency", "NOK"),
-                        available_seats=first_fare.get("avlSeats", 0),
+                        available_seats=int(first_fare.get("avlSeats", 0) or 0),
                         booking_class=first_fare.get("bookingClass", ""),
                         segments=segments,
                         total_duration_minutes=total_duration,
                         stops=stops,
-                        flight_id=flight_key
+                        flight_id=flight_key,
+                        is_saver_award=is_saver,
+                        product_type=prod_type,
+                        fare_class=first_fare.get("fareClass", ""),
+                        cash_price=float(price_info.get("totalPrice", 0) or 0),
+                        base_price=float(price_info.get("basePrice", 0) or 0),
+                        lowest_fare=product.get("lowestFare", False),
+                        sas_recommended=product.get("sasRecommended", False)
                     ))
         
         return offers
@@ -717,17 +821,23 @@ def main():
     parser.add_argument("--date", default="20260205", help="Date (YYYYMMDD)")
     parser.add_argument("--cabin", choices=["ECONOMY", "PREMIUM", "BUSINESS"], help="Cabin filter")
     parser.add_argument("--cookies", "-c", help="Path to cookies file for Cloudflare bypass")
-    parser.add_argument("--mode", choices=["offers", "calendar", "routes"], default="offers",
-                       help="API mode: offers (points), calendar (availability), routes (times)")
+    parser.add_argument("--mode", choices=["offers", "calendar", "routes", "partner"], default="offers",
+                       help="API mode: offers (SAS points), calendar (availability), routes (times), partner (Star Alliance)")
     args = parser.parse_args()
     
     # Auto-detect cookies file if not specified
     cookies_file = args.cookies
     if not cookies_file:
-        default_cookie_path = Path(__file__).parent / "cookies.txt"
+        default_cookie_path = Path(__file__).parent / "sas_session.json"
         if default_cookie_path.exists():
             cookies_file = str(default_cookie_path)
-            print(f"📝 Using cookies from {default_cookie_path}")
+            print(f"📝 Using session from {default_cookie_path}")
+        else:
+             # Fallback to cookies.txt
+             txt_path = Path(__file__).parent / "cookies.txt"
+             if txt_path.exists():
+                 cookies_file = str(txt_path)
+                 print(f"📝 Using cookies from {txt_path}")
     
     api = SASSearchEngine(cookies_file=cookies_file) if cookies_file else SASSearchEngine()
     
@@ -760,6 +870,93 @@ def main():
             print(f"  {r.departure_time} → {r.arrival_time} ({r.total_time//60}h{r.total_time%60}m) | {stops_str}")
             print(f"    Seats: Economy={r.availability.get('AG',0)} Premium={r.availability.get('AP',0)} Business={r.availability.get('AB',0)}")
         return
+        
+    if args.mode == "partner":
+        # Partner awards mode
+        date = args.date
+        if len(date) == 8:
+            date = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
+            
+        try:
+            res = api.get_partner_awards(args.origin, args.destination, date)
+            flights = res.get("outboundFlights", [])
+            if not flights:
+                print("❌ No partner flights found")
+                return
+                
+            print(f"✅ Found {len(flights)} partner options:\n")
+            for f in flights:
+                segments = f.get("segments", [])
+                
+                # Build route string
+                route_str = ""
+                carriers = []
+                total_duration = 0
+                
+                if segments:
+                    deps = [s.get("departureAirport", {}).get("code", "") for s in segments]
+                    arrs = [s.get("arrivalAirport", {}).get("code", "") for s in segments]
+                    # Full path: Dep1 -> Arr1/Dep2 -> Arr2 ...
+                    path = []
+                    for i, s in enumerate(segments):
+                        d_code = s.get("departureAirport", {}).get("code", "???")
+                        a_code = s.get("arrivalAirport", {}).get("code", "???")
+                        path.append(d_code)
+                        if i == len(segments) - 1:
+                            path.append(a_code)
+                    
+                    route_str = " -> ".join(path)
+                    
+                    for s in segments:
+                        c_raw = s.get("marketingCarrier", {})
+                        if isinstance(c_raw, dict):
+                            carriers.append(c_raw.get("code", "??"))
+                        else:
+                            carriers.append(str(c_raw))
+                    
+                    import re
+                    for s in segments:
+                        raw_dur = s.get("duration", 0)
+                        d_mins = 0
+                        if isinstance(raw_dur, int):
+                            d_mins = raw_dur
+                        elif isinstance(raw_dur, str):
+                            if ":" in raw_dur:
+                                parts = raw_dur.split(":")
+                                d_mins = int(parts[0]) * 60 + int(parts[1])
+                            elif "h" in raw_dur:
+                                # Parse "1h 20m" or "1h" or "45m"
+                                h = 0
+                                m = 0
+                                match_h = re.search(r'(\d+)h', raw_dur)
+                                match_m = re.search(r'(\d+)m', raw_dur)
+                                if match_h: h = int(match_h.group(1))
+                                if match_m: m = int(match_m.group(1))
+                                d_mins = h * 60 + m
+                            else:
+                                try: d_mins = int(raw_dur)
+                                except: pass
+                        total_duration += d_mins
+                
+                cabins = f.get("cabins", [])
+                points_str = "N/A"
+                for c in cabins:
+                     # Usually just one price for partner awards or tiered
+                     p = c.get("price", {}).get("points", 0)
+                     if p:
+                         points_str = f"{p} pts"
+                         break
+                         
+                carrier_str = "/".join(carriers)
+                duration_str = f"{total_duration//60}h{total_duration%60}m"
+                
+                print(f"  ✈️  {carrier_str} | {route_str} | {duration_str} | {points_str}")
+                
+        except Exception as e:
+            print(f"❌ Partner search failed: {e}")
+            import traceback
+            traceback.print_exc()
+        return
     
     # Default: offers mode with points pricing
     offers = api.search_flights(
@@ -779,22 +976,41 @@ def main():
     print(f"✅ Found {len(offers)} flight offers:\n")
     
     # Group by cabin
-    cabins = {}
-    for offer in offers:
-        if offer.cabin_class not in cabins:
-            cabins[offer.cabin_class] = []
-        cabins[offer.cabin_class].append(offer)
+    offers_by_cabin = {}
+    for o in offers:
+        if o.cabin_class not in offers_by_cabin:
+            offers_by_cabin[o.cabin_class] = []
+        offers_by_cabin[o.cabin_class].append(o)
     
-    for cabin, cabin_offers in sorted(cabins.items()):
+    for cabin in sorted(offers_by_cabin.keys()):
         print(f"=== {cabin} ===")
-        for offer in sorted(cabin_offers, key=lambda o: o.points)[:3]:
-            stops_str = "Direct" if offer.is_direct else f"{offer.stops} stop(s)"
-            route = " → ".join([s.departure_airport for s in offer.segments] + [offer.destination])
-            print(f"  {offer.points:>7,} pts + {offer.taxes:>6.0f} {offer.currency} | {stops_str} | {route}")
-            print(f"           {offer.product_name} | {offer.available_seats} seats | {offer.total_duration_hours:.1f}h")
-        print()
-
-
+        for o in offers_by_cabin[cabin]:
+            stops_str = "Direct" if o.is_direct else f"{o.stops} stop(s)"
+            
+            # Highlight AWARD tickets
+            prefix = "🌟 AWARD" if o.is_saver_award else "  Upsell"
+            
+            # Format route
+            route_parts = [s.departure_airport for s in o.segments] + [o.destination]
+            route = " → ".join(route_parts)
+            
+            # Show recommendation
+            rec_tag = " [REC]" if o.sas_recommended else ""
+            low_tag = " [CHEAPEST]" if o.lowest_fare else ""
+            
+            # Price in NOK (if it's an upsell, this is helpful to see the conversion)
+            price_nok = f" ({o.cash_price:,.0f} {o.currency})" if o.cash_price > 0 else ""
+            
+            print(f"  {prefix} | {o.points:>7,} pts + {o.taxes:>4.0f} {o.currency}{price_nok} | {stops_str}{rec_tag}{low_tag} | {route}")
+            
+            # Detail line
+            segment_details = []
+            for s in o.segments:
+                term_info = f" T{s.departure_terminal}" if s.departure_terminal else ""
+                segment_details.append(f"{s.carrier} {s.flight_number}{term_info} ({s.aircraft})")
+            
+            print(f"           {o.product_name} ({o.booking_class}) | {o.available_seats} seats | {o.total_duration_hours:.1f}h | {' / '.join(segment_details)}")
+        print("")
+    return
 if __name__ == "__main__":
     main()
-

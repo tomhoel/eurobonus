@@ -16,7 +16,8 @@ def main():
         res = engine.session.get("https://www.flysas.com/bff/profile/profiles/profile-button/v2")
         if res.status_code == 200:
             data = res.json()
-            logger.info(f"✅ Profile API: SUCCESS. Points Balance: {data.get('pointsBalance', 'Unknown')}")
+            points = data.get("eb", {}).get("availablePoints", "Unknown")
+            logger.info(f"✅ Profile API: SUCCESS. Points Balance: {points}")
         else:
             logger.warning(f"🛑 Profile API: FAILED ({res.status_code})")
     except Exception as e:
@@ -33,18 +34,27 @@ def main():
     except Exception as e:
         logger.error(f"Calendar API Error: {e}")
 
-    # 3. Test Partner API (The sensitive one)
-    logger.info("🧪 Testing Partner API (Real-time)...")
-    try:
-        data = engine.get_partner_awards("CPH", "NYC", "2026-03-01")
-        if "outboundFlights" in data:
-            logger.info("✅ Partner API: SUCCESS.")
-        elif "error" in str(data) or "429" in str(data):
-            logger.warning(f"🛑 Partner API: FLAGGED/FAILED. Response: {data}")
-        else:
-            logger.info(f"✅ Partner API: SUCCESS (Response received: {list(data.keys())})")
-    except Exception as e:
-        logger.error(f"Partner API Error: {e}")
+    # 3. Test Standard SAS Offers API
+    logger.info("🧪 Testing Standard SAS Offers API...")
+    test_routes = [
+        ("OSL", "CPH", "2026-03-01"),
+        ("CPH", "BKK", "2026-02-11"),
+        ("EWR", "CPH", "2026-04-10")
+    ]
+    
+    for origin, dest, date in test_routes:
+        try:
+            logger.info(f"   Searching {origin} -> {dest} on {date}...")
+            offers = engine.search_flights(origin, dest, date)
+            if offers:
+                logger.info(f"   ✅ SUCCESS. Found {len(offers)} offers.")
+                for offer in offers[:2]:
+                    logger.info(f"      - {offer.product_name}: {offer.points} pts, {offer.available_seats} seats")
+                break # Found some, we're good
+            else:
+                logger.info(f"   ℹ️ No availability for {origin} -> {dest}")
+        except Exception as e:
+            logger.error(f"   ❌ Offers API Error ({origin}-{dest}): {e}")
 
 if __name__ == "__main__":
     main()
