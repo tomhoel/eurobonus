@@ -1,42 +1,42 @@
 version: '3.8'
 
 services:
-  # SAS Award Monitor - checks for new tickets every 15 minutes
+  # Session Refresher - smart refresh with validity check
+  refresher:
+    build: .
+    container_name: sas-session-refresher
+    restart: always
+    command: python session_refresher.py
+    volumes:
+      - ./sas_session.json:/home/botuser/app/sas_session.json
+      - ./data:/home/botuser/app/data
+    environment:
+      - HEADLESS=false
+      - CHECK_INTERVAL=172800  # 48 hours in seconds
+    env_file: .env
+
+  # Award Monitor
   monitor:
     build: .
     container_name: sas-monitor
     restart: unless-stopped
-    command: python sas_monitor.py --daemon
+    command: python sas_monitor.py
     volumes:
-      - ./data:/app/data
-      - ./cookies.txt:/app/cookies.txt:ro
-    environment:
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
-      - DB_PATH=/app/data/sas_monitor.db
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+      - ./data:/home/botuser/app/data
+      - ./sas_session.json:/home/botuser/app/sas_session.json:ro
+    env_file: .env
+    depends_on:
+      - refresher
 
-  # Telegram Bot - interactive commands
+  # Telegram Bot
   bot:
     build: .
     container_name: sas-telegram-bot
     restart: unless-stopped
     command: python telegram_bot.py
     volumes:
-      - ./data:/app/data
-      - ./cookies.txt:/app/cookies.txt:ro
-    environment:
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
-      - DB_PATH=/app/data/sas_monitor.db
+      - ./data:/home/botuser/app/data
+      - ./sas_session.json:/home/botuser/app/sas_session.json:ro
+    env_file: .env
     depends_on:
       - monitor
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"

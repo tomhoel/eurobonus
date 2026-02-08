@@ -1,2242 +1,2004 @@
 #!/usr/bin/env python3
 """
-SAS EuroBonus Interactive Telegram Bot
-Provides /search command to query award availability on-demand.
+SAS EuroBonus Telegram Bot - Search & Subscription Interface
 
-Usage:
-    pip install python-telegram-bot
-    python telegram_bot.py
+Commands:
+- /start: Intro
+- /search [Origin]-[Dest]: Search award flights with interactive calendar
+- /search OSL-* or *-BKK: Multi-destination search
+- /search OSL-BKK cheap: Find cheapest across all dates
+- /search OSL-* 50000pts: Search within points budget
+- /subscribe [Origin] [Dest] [Cabin]: Add alert
+- /unsubscribe [ID]: Remove alert
+- /status: Health check
 """
 
-import argparse
-import json
-import logging
-import re
+import os
 import sys
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Optional
-
+import logging
+import asyncio
+import re
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Any, Tuple
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode, ChatAction
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
-# Import SAS API from the monitor
-from sas_monitor import SASAwardAPI, Config, DESTINATIONS, ORIGINS, EUROPE_AIRPORTS, ASIA_AIRPORTS
+from sas_monitor import Config, AvailabilityDatabase
+from sas_search_api import SASSearchEngine, AvailabilityDate, FlightOffer
 
-# ============================================================================
-# Configuration
-# ============================================================================
-
+# Logger setup
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Airport code to city name mapping
-AIRPORT_NAMES = {
-    # Origins
-    "OSL": "Oslo",
-    "CDG": "Paris",
-    "CPH": "Copenhagen",
-    "AMS": "Amsterdam",
-    # Destinations
-    "BKK": "Bangkok",
-    "NRT": "Tokyo Narita",
-    "HND": "Tokyo Haneda",
-    "KIX": "Osaka",
-    "PVG": "Shanghai",
-    "PEK": "Beijing",
-    "SGN": "Ho Chi Minh City",
-    "HAN": "Hanoi",
-    "SIN": "Singapore",
+
+# Region definitions for destination grouping
+REGIONS = {
+    "Scandinavia": ["OSL", "ARN", "CPH", "BGO", "TRD", "SVG", "GOT", "BLL", "AAL", "AAR", "TOS", "BOO", "KRS", "HAU", "AES", "MOL", "KSU", "SDN", "EVE", "BDU", "LYR"],
+    "Europe": ["LHR", "CDG", "AMS", "FRA", "MUC", "ZRH", "VIE", "BRU", "DUB", "MAN", "BCN", "MAD", "LIS", "FCO", "MXP", "ATH", "IST", "WAW", "PRG", "BUD", "HEL", "TLL", "RIX", "VNO", "GDN", "WRO", "KRK", "NCE", "GVA", "HAM", "DUS", "BER", "EDI", "GLA"],
+    "Asia": ["BKK", "HKT", "KBV", "HND", "NRT", "SIN", "HKG", "PVG", "PEK", "ICN", "DEL", "BOM", "KUL", "CGK", "MNL", "TPE", "SGN", "HAN"],
+    "Americas": ["JFK", "EWR", "LAX", "SFO", "MIA", "ORD", "BOS", "IAD", "YYZ", "YVR", "YUL", "GRU", "EZE", "MEX", "PTY"],
+    "Middle East": ["DXB", "DOH", "AUH", "TLV", "AMM", "CAI", "JED", "RUH"],
+    "Africa": ["JNB", "CPT", "NBO", "ADD", "CMN", "LOS", "ACC"],
+    "Oceania": ["SYD", "MEL", "AKL", "BNE", "PER"],
 }
 
-# Cabin class mapping
-CABIN_CLASSES = {
-    "AG": {"name": "Economy", "emoji": "💺"},
-    "AP": {"name": "Premium", "emoji": "⭐"},
-    "AB": {"name": "Business", "emoji": "💼"},
-}
-
-
-# ============================================================================
-# Route Parser
-# ============================================================================
-
-def parse_route(text: str) -> Optional[tuple[str, str, Optional[str]]]:
-    """
-    Parse route from user input.
-
-    Accepts formats:
-    - OSL - BKK (origin and destination)
-    - OSL-BKK
-    - OSL BKK
-    - OSL (origin only - returns all destinations)
-    - osl bkk
-    - OSL BKK July (with month)
-    - OSL BKK 2026-03 (with month)
-    - to BKK (reverse search - all origins to destination)
-    - TO BKK July (reverse search with month)
-
-    Returns:
-        Tuple of (origin, destination, month) or None if invalid
-        destination can be None for origin-only queries
-        origin can be None for reverse (destination-only) queries
-    """
-    # Remove command prefix if present
-    text = re.sub(r'^/(search|history|calendar)\s+', '', text, flags=re.IGNORECASE)
-
-    # Check for reverse search pattern "to DESTINATION"
-    reverse_match = re.search(r'\bto\s+([A-Za-z]{3})\b', text, re.IGNORECASE)
-
-    # Check for month parameter (e.g., "July", "March", "2026-03")
-    month_pattern = r'\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{4}-\d{2})\b'
-    month_match = re.search(month_pattern, text, re.IGNORECASE)
-    month = None
-    if month_match:
-        month_str = month_match.group(1).lower()
-        # Convert month name to YYYYMM format
-        month_names = {
-            'january': '01', 'jan': '01', 'february': '02', 'feb': '02',
-            'march': '03', 'mar': '03', 'april': '04', 'apr': '04',
-            'may': '05', 'june': '06', 'jun': '06', 'july': '07', 'jul': '07',
-            'august': '08', 'aug': '08', 'september': '09', 'sep': '09',
-            'october': '10', 'oct': '10', 'november': '11', 'nov': '11',
-            'december': '12', 'dec': '12'
-        }
-        if month_str in month_names:
-            # Assume current or next year
-            from datetime import datetime
-            current_year = datetime.now().year
-            month = f"{current_year}{month_names[month_str]}"
-        elif re.match(r'\d{4}-\d{2}', month_str):
-            month = month_str.replace('-', '')
-        # Remove month from text for airport code extraction
-        text = re.sub(month_pattern, '', text, flags=re.IGNORECASE)
-
-    # Handle reverse search
-    if reverse_match:
-        destination = reverse_match.group(1).upper()
-        if destination not in AIRPORT_NAMES:
-            return None
-        # Return None as origin to indicate reverse search
-        return None, destination, month
-
-    # Extract airport codes (3 letters)
-    codes = re.findall(r'\b([A-Za-z]{3})\b', text)
-
-    if len(codes) < 1:
-        return None
-
-    origin = codes[0].upper()
-
-    # Validate origin
-    if origin not in AIRPORT_NAMES:
-        return None
-
-    # Check if destination provided
-    if len(codes) >= 2:
-        destination = codes[1].upper()
-        # Validate destination
-        if destination not in AIRPORT_NAMES:
-            return None
-        return origin, destination, month
-    else:
-        # Origin-only query
-        return origin, None, month
-
-
-# ============================================================================
-# Message Formatters
-# ============================================================================
-
-def format_origin_search_results(
-    origin: str,
-    data: List[Dict],
-    month: Optional[str] = None
-) -> str:
-    """
-    Format search results for origin-only query (all destinations).
-    Sort by: Business seats > Premium > Economy, then by soonest date.
-    """
-    if not data:
-        return (
-            f"🔍 <b>Search: {origin} → ALL DESTINATIONS</b>\n\n"
-            f"❌ No availability data found."
-        )
-
-    # Collect all availability across all destinations
-    all_availability = []
-    for dest_data in data:
-        destination = dest_data.get("airportCode", "")
-        city_name = dest_data.get("cityName", AIRPORT_NAMES.get(destination, destination))
-
-        for direction_key in ["outbound", "inbound"]:
-            direction_data = dest_data.get("availability", {}).get(direction_key, [])
-            for avail in direction_data:
-                date = avail.get("date", "")
-                if not date:
-                    continue
-
-                # Get seat counts
-                business = avail.get("AB", 0)
-                premium = avail.get("AP", 0)
-                economy = avail.get("AG", 0)
-
-                # Only include if has availability
-                if business + premium + economy > 0:
-                    all_availability.append({
-                        'destination': destination,
-                        'city_name': city_name,
-                        'date': date,
-                        'direction': direction_key,
-                        'business': business,
-                        'premium': premium,
-                        'economy': economy,
-                        # Sort key: prioritize business, then total seats, then date
-                        'sort_key': (
-                            -business,  # Most business seats first (negative for descending)
-                            -(business + premium + economy),  # Then total seats
-                            date  # Then earliest date
-                        )
-                    })
-
-    if not all_availability:
-        return (
-            f"🔍 <b>Search: {origin} → ALL DESTINATIONS</b>\n\n"
-            f"ℹ️ No available seats found."
-        )
-
-    # Sort by priority
-    all_availability.sort(key=lambda x: x['sort_key'])
-
-    # Build message
-    origin_name = AIRPORT_NAMES.get(origin, origin)
-    message = f"🔍 <b>{origin_name} ({origin}) → ALL DESTINATIONS</b>\n\n"
-    message += f"Found {len(all_availability)} available flights\n"
-    message += f"<i>Sorted by: Business seats → Total seats → Date</i>\n\n"
-
-    # Group by destination for display
-    by_destination = {}
-    for item in all_availability[:50]:  # Limit to 50 results
-        dest = item['destination']
-        if dest not in by_destination:
-            by_destination[dest] = {
-                'city_name': item['city_name'],
-                'flights': []
-            }
-        by_destination[dest]['flights'].append(item)
-
-    for destination, dest_info in list(by_destination.items())[:10]:  # Show top 10 destinations
-        message += f"✈️ <b>{dest_info['city_name']} ({destination})</b>\n"
-
-        for flight in dest_info['flights'][:5]:  # Show top 5 flights per destination
-            # Format date
-            try:
-                date_obj = datetime.strptime(flight['date'], "%Y-%m-%d")
-                date_display = date_obj.strftime("%b %d")
-            except:
-                date_display = flight['date']
-
-            direction_emoji = "📤" if flight['direction'] == "outbound" else "📥"
-
-            # Build seat info
-            seat_parts = []
-            if flight['business'] > 0:
-                seat_parts.append(f"💼 Business: {flight['business']}")
-            if flight['premium'] > 0:
-                seat_parts.append(f"⭐ Premium: {flight['premium']}")
-            if flight['economy'] > 0:
-                seat_parts.append(f"💺 Economy: {flight['economy']}")
-
-            message += f"  {direction_emoji} {date_display}: {', '.join(seat_parts)}\n"
-
-        message += "\n"
-
-    if len(by_destination) > 10:
-        message += f"<i>...and {len(by_destination) - 10} more destinations</i>\n\n"
-
-    booking_url = f"https://www.sas.no/award-finder?origin={origin}"
-    message += f'<a href="{booking_url}">🔗 Book on SAS</a>'
-
-    return message.strip()
-
-
-def format_reverse_search_results(
-    destination: str,
-    data: List[Dict],
-    month: Optional[str] = None
-) -> str:
-    """
-    Format search results for reverse search (all origins to a destination).
-    Shows two sections: OUTBOUND (to destination) first, then RETURN (from destination).
-    """
-    dest_name = AIRPORT_NAMES.get(destination, destination)
-
-    if not data:
-        return (
-            f"🔍 <b>ALL ROUTES → {dest_name} ({destination})</b>\n\n"
-            f"❌ No availability data found."
-        )
-
-    # Collect all availability, separated by direction
-    outbound_flights = []  # Flying TO destination
-    return_flights = []    # Flying FROM destination
-
-    for dest_data in data:
-        origin = dest_data.get("origin", "")
-        if not origin:
-            continue
-
-        origin_name = AIRPORT_NAMES.get(origin, origin)
-
-        for direction_key in ["outbound", "inbound"]:
-            direction_data = dest_data.get("availability", {}).get(direction_key, [])
-            for avail in direction_data:
-                date = avail.get("date", "")
-                if not date:
-                    continue
-
-                # Get seat counts
-                business = avail.get("AB", 0)
-                premium = avail.get("AP", 0)
-                economy = avail.get("AG", 0)
-
-                # Only include if has availability
-                if business + premium + economy > 0:
-                    flight_info = {
-                        'origin': origin,
-                        'origin_name': origin_name,
-                        'date': date,
-                        'business': business,
-                        'premium': premium,
-                        'economy': economy,
-                        # Sort key: prioritize business, then total seats, then date
-                        'sort_key': (
-                            -business,
-                            -(business + premium + economy),
-                            date
-                        )
-                    }
-                    
-                    if direction_key == "outbound":
-                        outbound_flights.append(flight_info)
-                    else:
-                        return_flights.append(flight_info)
-
-    if not outbound_flights and not return_flights:
-        return (
-            f"🔍 <b>ALL ROUTES → {dest_name} ({destination})</b>\n\n"
-            f"ℹ️ No available seats found."
-        )
-
-    # Sort both lists
-    outbound_flights.sort(key=lambda x: x['sort_key'])
-    return_flights.sort(key=lambda x: x['sort_key'])
-
-    # Build message
-    total_flights = len(outbound_flights) + len(return_flights)
-    message = f"🔍 <b>ALL ROUTES → {dest_name} ({destination})</b>\n\n"
-    message += f"Found {total_flights} available flights\n\n"
-
-    # Helper function to build a section
-    def build_section(flights: list, limit: int = 25) -> str:
-        section = ""
-        by_origin = {}
-        for item in flights[:limit]:
-            orig = item['origin']
-            if orig not in by_origin:
-                by_origin[orig] = {
-                    'origin_name': item['origin_name'],
-                    'flights': []
-                }
-            by_origin[orig]['flights'].append(item)
-
-        for origin, orig_info in list(by_origin.items())[:8]:
-            section += f"✈️ <b>{orig_info['origin_name']} ({origin})</b>\n"
-
-            for flight in orig_info['flights'][:5]:
-                # Format date
-                try:
-                    date_obj = datetime.strptime(flight['date'], "%Y-%m-%d")
-                    date_display = date_obj.strftime("%b %d")
-                except:
-                    date_display = flight['date']
-
-                # Build seat info
-                seat_parts = []
-                if flight['business'] > 0:
-                    seat_parts.append(f"💼 Business: {flight['business']}")
-                if flight['premium'] > 0:
-                    seat_parts.append(f"⭐ Premium: {flight['premium']}")
-                if flight['economy'] > 0:
-                    seat_parts.append(f"💺 Economy: {flight['economy']}")
-
-                section += f"  {date_display}: {', '.join(seat_parts)}\n"
-
-            section += "\n"
-        
-        return section
-
-    # Section 1: OUTBOUND (flying TO destination)
-    if outbound_flights:
-        message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        message += f"📤 <b>OUTBOUND (Flying TO {dest_name})</b>\n"
-        message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        message += build_section(outbound_flights)
-
-    # Section 2: RETURN (flying FROM destination)
-    if return_flights:
-        message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        message += f"📥 <b>RETURN (Flying FROM {dest_name})</b>\n"
-        message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        message += build_section(return_flights)
-
-    booking_url = f"https://www.sas.no/award-finder?destination={destination}"
-    message += f'<a href="{booking_url}">🔗 Book on SAS</a>'
-
-    return message.strip()
-
-
-def format_search_results(
-    origin: str,
-    destination: str,
-    data: List[Dict],
-    compact: bool = False
-) -> str:
-    """
-    Format search results into a nicely structured message.
-
-    Args:
-        origin: Origin IATA code
-        destination: Destination IATA code
-        data: API response data
-        compact: If True, use more compact formatting
-
-    Returns:
-        Formatted message string
-    """
-    if not data:
-        return (
-            f"🔍 <b>Search: {origin} → {destination}</b>\n\n"
-            f"❌ No availability data found.\n\n"
-            f"This route may not exist or has no award seats available."
-        )
-
-    dest_data = data[0]
-    city_name = dest_data.get("cityName", AIRPORT_NAMES.get(destination, destination))
-
-    # Header
-    message = f"🔍 <b>Search: {origin} → {city_name} ({destination})</b>\n\n"
-
-    # Process outbound and inbound
-    availability = dest_data.get("availability", {})
-
-    for direction_key, direction_emoji, direction_label in [
-        ("outbound", "📤", "OUTBOUND"),
-        ("inbound", "📥", "RETURN")
-    ]:
-        direction_data = availability.get(direction_key, [])
-
-        if not direction_data:
-            continue
-
-        # Determine direction display
-        if direction_key == "outbound":
-            route_display = f"{origin} → {destination}"
-        else:
-            route_display = f"{destination} → {origin}"
-
-        message += f"{direction_emoji} <b>{direction_label} ({route_display})</b>\n"
-
-        # Sort by date
-        direction_data_sorted = sorted(direction_data, key=lambda x: x.get("date", ""))
-
-        available_dates = []
-        for avail in direction_data_sorted:
-            date = avail.get("date", "")
-            if not date:
-                continue
-
-            # Get seat counts for each cabin class
-            seats = {}
-            has_availability = False
-            for cabin_code in ["AG", "AP", "AB"]:
-                seat_count = avail.get(cabin_code, 0)
-                seats[cabin_code] = seat_count
-                if seat_count > 0:
-                    has_availability = True
-
-            # Only show dates with availability
-            if has_availability:
-                available_dates.append((date, seats))
-
-        if available_dates:
-            for date, seats in available_dates:
-                # Format date (YYYY-MM-DD -> more readable)
-                try:
-                    date_obj = datetime.strptime(date, "%Y-%m-%d")
-                    date_display = date_obj.strftime("%b %d, %Y")  # e.g., "Feb 15, 2026"
-                except:
-                    date_display = date
-
-                # Build seat availability string
-                seat_parts = []
-                for cabin_code in ["AG", "AP", "AB"]:
-                    count = seats[cabin_code]
-                    if count > 0:
-                        emoji = CABIN_CLASSES[cabin_code]["emoji"]
-                        name = CABIN_CLASSES[cabin_code]["name"]
-                        seat_parts.append(f"{emoji} {name}: {count}")
-
-                if compact:
-                    message += f"  📅 {date_display}: {' | '.join(seat_parts)}\n"
-                else:
-                    message += f"  📅 <b>{date_display}</b>\n"
-                    for part in seat_parts:
-                        message += f"     {part}\n"
-        else:
-            message += f"  ℹ️ No available dates\n"
-
-        message += "\n"
-
-    # Footer with booking link
-    booking_url = f"https://www.sas.no/award-finder?origin={origin}&destination={destination}"
-    message += f'<a href="{booking_url}">🔗 Book on SAS</a>\n'
-
-    return message.strip()
-
-
-def format_error_message(error_type: str, details: str = "") -> str:
-    """Format error message for user."""
-    errors = {
-        "invalid_format": (
-            "❌ <b>Invalid format</b>\n\n"
-            "Please use: <code>/search ORIGIN DESTINATION</code>\n\n"
-            "Example: <code>/search OSL BKK</code>"
-        ),
-        "invalid_airports": (
-            "❌ <b>Unknown airport codes</b>\n\n"
-            "Please check the airport codes and try again.\n\n"
-            f"Valid airports:\n{details}"
-        ),
-        "api_error": (
-            "❌ <b>API Error</b>\n\n"
-            "Could not fetch data from SAS. Please try again later.\n\n"
-            f"Details: {details}"
-        ),
-        "rate_limit": (
-            "⏱️ <b>Rate limit</b>\n\n"
-            "Please wait a moment before searching again."
-        ),
+# Major SAS hubs for reverse lookups (finding origins that fly TO a destination)
+REVERSE_SEARCH_HUBS = [
+    "OSL", "CPH", "ARN", "BGO", "TRD", "SVG",  # Scandinavia
+    "LHR", "FRA", "AMS", "CDG", "MUC", "ZRH",  # Europe
+    "JFK", "EWR", "LAX", "MIA", "SFO",         # Americas
+]
+
+def get_region(airport_code: str) -> str:
+    """Get region for an airport code."""
+    for region, codes in REGIONS.items():
+        if airport_code in codes:
+            return region
+    return "Other"
+
+
+class SubscriptionBot:
+    # Cabin mappings
+    CABIN_CODES = {"ECONOMY": "AG", "PREMIUM": "AP", "BUSINESS": "AB"}
+    CABIN_NAMES = {"AG": "Economy", "AP": "Premium", "AB": "Business"}
+
+    # Sort options
+    SORT_OPTIONS = {
+        "date": ("📅 Date", lambda d: d.date),
+        "seats": ("💺 Seats", lambda d: -(d.economy_seats + d.premium_seats + d.business_seats)),
+        "biz": ("👔 Business", lambda d: -d.business_seats),
     }
-    return errors.get(error_type, f"❌ Error: {details}")
 
+    def __init__(self):
+        self.config = Config.from_env()
+        self.db = AvailabilityDatabase(self.config.db_path)
 
-# ============================================================================
-# Bot Command Handlers
-# ============================================================================
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command."""
-    welcome_message = """
-👋 <b>Welcome to SAS EuroBonus Award Search Bot!</b>
-
-I can help you search for award availability on SAS routes.
-
-<b>Quick Search:</b> Tap a destination below to search from Oslo.
-
-<b>Commands:</b>
-/search OSL BKK - Search for routes
-/calendar OSL BKK - Calendar view
-/best - Best business availability
-/status - System status
-/help - Full help
-"""
-    # Create inline keyboard with popular destinations
-    keyboard = [
-        [
-            InlineKeyboardButton("🇹🇭 Bangkok", callback_data="search:OSL:BKK"),
-            InlineKeyboardButton("🇯🇵 Tokyo", callback_data="search:OSL:NRT"),
-            InlineKeyboardButton("🇸🇬 Singapore", callback_data="search:OSL:SIN"),
-        ],
-        [
-            InlineKeyboardButton("🇯🇵 Osaka", callback_data="search:OSL:KIX"),
-            InlineKeyboardButton("🇨🇳 Shanghai", callback_data="search:OSL:PVG"),
-            InlineKeyboardButton("🇻🇳 Hanoi", callback_data="search:OSL:HAN"),
-        ],
-        [
-            InlineKeyboardButton("📊 Status", callback_data="status"),
-            InlineKeyboardButton("💎 Best Bets", callback_data="best"),
-        ],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        welcome_message, 
-        parse_mode=ParseMode.HTML,
-        reply_markup=reply_markup
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command."""
-    help_text = """
-<b>SAS EuroBonus Award Search Bot</b>
-
-<b>🔔 Notifications:</b>
-/notify - Subscribe to instant alerts
-/unsubscribe - Stop notifications
-
-<b>🔍 Search:</b>
-/search OSL BKK - Search specific route
-/search OSL - Search all from Oslo
-/search OSL BKK July - Filter by month
-
-<b>📚 Browse Tickets:</b>
-/catalogue - Browse all tracked tickets with change history
-
-<b>📊 Analytics:</b>
-/sales - Fastest selling tickets
-/velocity - Hottest tickets (booking now)
-/stats - System statistics
-/best - Best business class availability
-
-<b>📅 Other:</b>
-/calendar OSL BKK - Emoji calendar view
-/history OSL BKK - Release history
-/alerts - View notification history
-/status - System health
-
-<b>Supported Routes:</b>
-Origins: OSL, CDG, CPH, AMS
-Destinations: BKK, NRT, HND, KIX, PVG, PEK, SGN, HAN, SIN
-
-<b>Examples:</b>
-<code>/notify</code>
-<code>/search OSL</code>
-<code>/catalogue</code>
-<code>/sales</code>
-"""
-    await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
-
-
-async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle /search command.
-
-    Parses route, queries SAS API, and returns formatted results.
-    Supports:
-    - origin+destination queries (e.g., /search OSL BKK)
-    - origin-only queries (e.g., /search OSL) - shows tracked destinations only
-    - reverse search (e.g., /search to BKK) - shows all origins to destination
-    """
-    user = update.effective_user
-    query_text = update.message.text
-
-    logger.info(f"Search request from {user.username or user.id}: {query_text}")
-
-    # Parse route from message
-    parsed = parse_route(query_text)
-
-    if not parsed:
-        # Invalid format - show error
-        airport_list = "\n".join([f"  {code} - {name}" for code, name in sorted(AIRPORT_NAMES.items())])
-        error_msg = format_error_message("invalid_airports", airport_list)
-        await update.message.reply_text(error_msg, parse_mode=ParseMode.HTML)
-        return
-
-    origin, destination, month = parsed
-
-    # Get API client from context
-    api: SASAwardAPI = context.bot_data.get("api")
-    if not api:
-        await update.message.reply_text("❌ API client not initialized", parse_mode=ParseMode.HTML)
-        return
-
-    # Check for reverse search (origin is None)
-    if origin is None and destination is not None:
-        # Reverse search - find all origins going to this destination
-        month_text = f" ({month[:4]}-{month[4:]})" if month else ""
-        dest_name = AIRPORT_NAMES.get(destination, destination)
-        status_msg = await update.message.reply_text(
-            f"🔍 Searching ALL ORIGINS → {dest_name} ({destination}){month_text}...",
-            parse_mode=ParseMode.HTML
-        )
-
-        try:
-            logger.info(f"Reverse search for all origins to {destination}")
-
-            # Query each tracked origin to this destination
-            filtered_data = []
-            for orig in ORIGINS:
-                try:
-                    avail_data = api.get_availability(origin=orig, destination=destination, month=month or "")
-                    if avail_data:
-                        # Add origin info to the data since API doesn't include it
-                        for item in avail_data:
-                            item['origin'] = orig
-                        filtered_data.extend(avail_data)
-                except:
-                    # Skip origins that fail
-                    pass
-
-            # Format results using reverse search formatter
-            result_message = format_reverse_search_results(destination, filtered_data, month)
-
-            await status_msg.edit_text(
-                result_message,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True
-            )
-
-            logger.info(f"Reverse search completed: ALL → {destination}")
-
-        except Exception as e:
-            logger.error(f"Reverse search failed: {e}")
-            error_msg = format_error_message("api_error", str(e))
-            await status_msg.edit_text(error_msg, parse_mode=ParseMode.HTML)
-
-        return
-
-    # Check if origin-only query
-    if destination is None:
-        # Origin-only search - detect if origin is European or Asian
-        # and query the opposite region as destinations
-        if origin in ASIA_AIRPORTS:
-            # Asian origin - query European destinations (return flights)
-            search_destinations = EUROPE_AIRPORTS
-            direction_label = "EUROPE"
-        else:
-            # European origin - query Asian destinations (outbound flights)
-            search_destinations = ASIA_AIRPORTS
-            direction_label = "ASIA"
-        
-        month_text = f" ({month[:4]}-{month[4:]})" if month else ""
-        status_msg = await update.message.reply_text(
-            f"🔍 Searching {origin} → {direction_label}{month_text}...",
-            parse_mode=ParseMode.HTML
-        )
-
-        try:
-            logger.info(f"Querying SAS API for {direction_label} destinations from {origin}")
-
-            # Query appropriate destinations
-            filtered_data = []
-            for dest in search_destinations:
-                try:
-                    avail_data = api.get_availability(origin=origin, destination=dest, month=month or "")
-                    if avail_data:
-                        filtered_data.extend(avail_data)
-                except:
-                    # Skip destinations that fail
-                    pass
-
-            # Format results
-            result_message = format_origin_search_results(origin, filtered_data, month)
-
-            await status_msg.edit_text(
-                result_message,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True
-            )
-
-            logger.info(f"Origin-only search completed: {origin} → TRACKED DESTINATIONS")
-
-        except Exception as e:
-            logger.error(f"Origin search failed: {e}")
-            error_msg = format_error_message("api_error", str(e))
-            await status_msg.edit_text(error_msg, parse_mode=ParseMode.HTML)
-
-        return
-
-    # Regular origin + destination search
-    month_text = f" ({month[:4]}-{month[4:]})" if month else ""
-    status_msg = await update.message.reply_text(
-        f"🔍 Searching {origin} → {destination}{month_text}...",
-        parse_mode=ParseMode.HTML
-    )
-
-    try:
-        # Query SAS API
-        logger.info(f"Querying SAS API: {origin} → {destination} (month: {month})")
-        data = api.get_availability(origin=origin, destination=destination, month=month or "")
-
-        # Check if we have results
-        has_availability = False
-        if data:
-            dest_data = data[0]
-            for direction in ["outbound", "inbound"]:
-                for avail in dest_data.get("availability", {}).get(direction, []):
-                    for cabin in ["AG", "AP", "AB"]:
-                        if avail.get(cabin, 0) > 0:
-                            has_availability = True
-                            break
-
-        # Format results
-        result_message = format_search_results(origin, destination, data, compact=False)
-
-        # Connection Checker: If no availability, suggest alternatives
-        if not has_availability:
-            alternatives = []
-            other_origins = [o for o in AIRPORT_NAMES.keys() if o != origin and o in ["OSL", "CDG", "CPH", "AMS"]]
-            for alt_origin in other_origins:
-                alt_data = api.get_availability(origin=alt_origin, destination=destination, month=month or "")
-                if alt_data:
-                    alt_dest = alt_data[0]
-                    for direction in ["outbound"]:
-                        for avail in alt_dest.get("availability", {}).get(direction, []):
-                            for cabin in ["AB", "AP", "AG"]:  # Prefer business
-                                seats = avail.get(cabin, 0)
-                                if seats > 0:
-                                    class_name = {"AG": "Economy", "AP": "Premium", "AB": "Business"}.get(cabin)
-                                    alternatives.append(f"  ✈️ {alt_origin}→{destination}: {seats} {class_name} on {avail['date']}")
-                                    break
-                            if alternatives:
-                                break
-                    if len(alternatives) >= 3:
-                        break
-
-            if alternatives:
-                result_message += "\n\n💡 <b>Alternative Origins:</b>\n" + "\n".join(alternatives[:3])
-
-        # Create inline keyboard for actions
-        keyboard = [
-            [
-                InlineKeyboardButton("🔄 Refresh", callback_data=f"search:{origin}:{destination}"),
-                InlineKeyboardButton("📅 Calendar", callback_data=f"calendar:{origin}:{destination}"),
-                InlineKeyboardButton("📜 History", callback_data=f"history:{origin}:{destination}"),
-            ]
+        # Initialize search engine with session if available
+        possible_paths = [
+            "sas_session.json",
+            "data/sas_session.json",
+            os.path.join(os.path.dirname(__file__), "sas_session.json"),
+            self.config.db_path.replace("sas_monitor.db", "sas_session.json"),
         ]
+
+        session_path = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                session_path = path
+                break
+
+        try:
+            if session_path:
+                self.search_engine = SASSearchEngine(cookies_file=session_path)
+                logger.info(f"Search engine initialized with session from {session_path}")
+            else:
+                self.search_engine = SASSearchEngine()
+                logger.warning("No session file found, using anonymous mode")
+        except Exception as e:
+            logger.warning(f"Failed to load session, using anonymous: {e}")
+            self.search_engine = SASSearchEngine()
+
+        # Cache for search results
+        self.search_cache: Dict[str, Dict[str, Any]] = {}
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Send a welcome message."""
+        await update.message.reply_text(
+            "✈️ **SAS EuroBonus Award Finder**\n\n"
+            "Search & monitor award seats 24/7.\n\n"
+            "**Search Commands:**\n"
+            "`/search OSL-BKK` - Search route\n"
+            "`/search OSL-BKK Feb` - Specific month\n"
+            "`/search OSL-BKK business` - Filter cabin\n"
+            "`/search OSL-BKK cheap` - Find cheapest\n"
+            "`/search OSL-BKK direct` - Direct flights only\n"
+            "`/search OSL-*` - All destinations from OSL\n"
+            "`/search *-BKK` - All origins to BKK\n"
+            "`/search OSL-* 50000pts` - Within budget\n\n"
+            "**Quick Finds:**\n"
+            "`/deals` - Hot deals right now\n"
+            "`/deals business` - Business class deals\n\n"
+            "**Alerts:**\n"
+            "`/subscribe OSL BKK Business` - Add alert\n"
+            "`/subscriptions` - List alerts\n"
+            "`/unsubscribe [ID]` - Remove alert\n"
+            "`/status` - System health",
+            parse_mode="Markdown"
+        )
+
+    async def subscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Add a new subscription."""
+        chat_id = str(update.effective_chat.id)
+        args = context.args
+
+        if len(args) < 2:
+            await update.message.reply_text(
+                "Usage: `/subscribe [Origin] [Dest] [Cabin] [bonus]`\n\n"
+                "Examples:\n"
+                "`/subscribe OSL BKK` - Any cabin, any ticket\n"
+                "`/subscribe OSL BKK Business` - Business only\n"
+                "`/subscribe OSL BKK bonus` - Any cabin, bonus tickets only\n"
+                "`/subscribe OSL BKK Business bonus` - Business bonus only\n\n"
+                "🌟 **Bonus tickets** = Fixed points (30k eco, 45k prem, 60k biz)\n"
+                "Can use AMEX 2-for-1 voucher!",
+                parse_mode="Markdown"
+            )
+            return
+
+        origin = args[0].upper()
+        dest = args[1].upper()
+
+        # Parse remaining args for cabin and saver_only
+        cabin = None
+        saver_only = False
+        valid_cabins = {"ECONOMY": "AG", "PREMIUM": "AP", "BUSINESS": "AB", "AG": "AG", "AP": "AP", "AB": "AB", "ECO": "AG", "PREM": "AP", "BIZ": "AB"}
+
+        for arg in args[2:]:
+            arg_upper = arg.upper()
+            if arg_upper in ("BONUS", "SAVER"):
+                saver_only = True
+            elif arg_upper in valid_cabins:
+                cabin = arg_upper
+
+        cabin_code = valid_cabins.get(cabin) if cabin else None
+
+        if self.db.add_subscription(chat_id, origin, dest, cabin_code, saver_only):
+            c_text = cabin or "ANY"
+            saver_text = " 🌟BONUS" if saver_only else ""
+            await update.message.reply_text(f"✅ Alert added: **{origin} → {dest}** ({c_text}{saver_text})\nI'll notify you when seats appear.", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("⚠️ You already have this exact subscription.")
+
+    async def list_subscriptions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """List active subscriptions."""
+        chat_id = str(update.effective_chat.id)
+        subs = self.db.get_subscriptions(chat_id)
+
+        if not subs:
+            await update.message.reply_text("You have no active alerts. Use `/subscribe` to add one.", parse_mode="Markdown")
+            return
+
+        msg = "**Your Active Alerts:**\n\n"
+        for s in subs:
+            cabin = s["cabin_filter"] or "ANY"
+            saver = s["saver_only"] if "saver_only" in s.keys() else 0
+            saver_text = " 🌟BONUS" if saver else ""
+            msg += f"🆔 `{s['id']}`: {s['origin']} ➡️ {s['destination']} ({cabin}{saver_text})\n"
+
+        msg += "\nTo remove: `/unsubscribe [ID]`"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    async def unsubscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Remove a subscription."""
+        chat_id = str(update.effective_chat.id)
+        args = context.args
+
+        if not args:
+            await update.message.reply_text("Usage: `/unsubscribe [ID]` (find ID with `/subscriptions`)")
+            return
+
+        try:
+            sub_id = int(args[0])
+            if self.db.remove_subscription(sub_id, chat_id):
+                await update.message.reply_text(f"🗑 Alert ID {sub_id} removed.")
+            else:
+                await update.message.reply_text(f"❌ Could not find alert ID {sub_id}.")
+        except ValueError:
+            await update.message.reply_text("ID must be a number.")
+
+    async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show system status (compact view)."""
+        await self._send_status_view(update.message, compact=True)
+
+    async def _send_status_view(self, message, compact: bool = True, edit: bool = False):
+        """Send status view (compact or expanded)."""
+        stats = self.db.get_stats()
+        session_valid = self.search_engine.session is not None
+
+        # Calculate cache freshness
+        cache_age = "N/A"
+        if stats["last_cache_update"]:
+            try:
+                last_update = datetime.strptime(stats["last_cache_update"], "%Y-%m-%d %H:%M:%S")
+                delta = datetime.now() - last_update
+                if delta.total_seconds() < 60:
+                    cache_age = f"{int(delta.total_seconds())}s ago"
+                elif delta.total_seconds() < 3600:
+                    cache_age = f"{int(delta.total_seconds() // 60)}m ago"
+                else:
+                    cache_age = f"{int(delta.total_seconds() // 3600)}h ago"
+            except:
+                cache_age = "Unknown"
+
+        if compact:
+            # Compact view
+            routes_str = f"{stats['routes']} routes" if stats['routes'] > 0 else "no routes"
+            msg = (
+                f"🟢 **System Status**\n\n"
+                f"📊 **Subscriptions**\n"
+                f"• Active: {stats['subscriptions']} alerts across {routes_str}\n"
+                f"• Notifications: {stats['notifications_today']} today | {stats['notifications_week']} this week\n\n"
+                f"✈️ **Cache**: {stats['cached_dates']} dates tracked | Updated {cache_age}\n"
+                f"🔐 **Session**: {'Valid ✅' if session_valid else 'Invalid ❌'}"
+            )
+            keyboard = [
+                [
+                    InlineKeyboardButton("📋 Details", callback_data="status:detail"),
+                    InlineKeyboardButton("🔄 Refresh", callback_data="status:refresh")
+                ]
+            ]
+        else:
+            # Expanded view
+            routes_list = ", ".join([f"{r[0]}-{r[1]}" for r in stats['route_list']]) if stats['route_list'] else "None"
+            seats_eco = stats['seats_by_cabin'].get('AG', 0) or 0
+            seats_biz = stats['seats_by_cabin'].get('AB', 0) or 0
+            seats_prem = stats['seats_by_cabin'].get('AP', 0) or 0
+
+            msg = (
+                f"🟢 **System Status**\n\n"
+                f"📊 **Subscriptions & Alerts**\n"
+                f"• Active: {stats['subscriptions']} alerts\n"
+                f"• Routes: {routes_list}\n"
+                f"• Notifications: {stats['notifications_today']} today | {stats['notifications_week']} this week\n\n"
+                f"✈️ **Availability Cache**\n"
+                f"• Dates tracked: {stats['cached_dates']}\n"
+                f"• Seats: Eco {seats_eco:,} | Prem {seats_prem:,} | Biz {seats_biz:,}\n"
+                f"• Last update: {cache_age}\n\n"
+                f"⏱️ **Monitor**\n"
+                f"• Tier 1 scan: hourly\n"
+                f"• Tier 2 verify: every 15min\n\n"
+                f"🔐 **Session**: {'Valid ✅' if session_valid else 'Invalid ❌'}"
+            )
+            keyboard = [
+                [
+                    InlineKeyboardButton("📋 Compact", callback_data="status:compact"),
+                    InlineKeyboardButton("🔄 Refresh", callback_data="status:refresh")
+                ]
+            ]
+
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        # Update the status message with results
-        await status_msg.edit_text(
-            result_message,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=reply_markup
-        )
+        if edit:
+            await message.edit_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
+        else:
+            await message.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
 
-        logger.info(f"Search completed: {origin} → {destination}")
+    # =========================================================================
+    # DEALS - HOT AWARD AVAILABILITY
+    # =========================================================================
 
-    except Exception as e:
-        logger.error(f"Search failed: {e}")
-        error_msg = format_error_message("api_error", str(e))
-        await status_msg.edit_text(error_msg, parse_mode=ParseMode.HTML)
-
-
-async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /history command."""
-    query_text = update.message.text
-    parsed = parse_route(query_text)
-
-    if not parsed:
-        await update.message.reply_text(
-            "❌ <b>Invalid format</b>\nUse: <code>/history OSL BKK</code>",
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    origin, destination, _ = parsed  # Ignore month for history
-    db_path = context.bot_data.get("db_path", "sas_monitor.db")
-
-    from sas_monitor import AvailabilityDatabase
-    adb = AvailabilityDatabase(db_path)
-
-    try:
-        history = adb.get_release_history(origin, destination)
-        if not history:
+    async def deals(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show hot deals - routes with most available award seats."""
+        # Parse optional cabin filter from args
+        cabin_filter = None
+        cabin_name = "All Cabins"
+        
+        if context.args:
+            arg = context.args[0].upper()
+            cabin_map = {
+                "ECONOMY": ("AG", "Economy"), "ECO": ("AG", "Economy"), "AG": ("AG", "Economy"),
+                "PREMIUM": ("AP", "Premium"), "PREM": ("AP", "Premium"), "AP": ("AP", "Premium"),
+                "BUSINESS": ("AB", "Business"), "BIZ": ("AB", "Business"), "AB": ("AB", "Business"),
+            }
+            if arg in cabin_map:
+                cabin_filter, cabin_name = cabin_map[arg]
+        
+        # Get best deals from database
+        deals = self.db.get_best_deals(limit=8, cabin_filter=cabin_filter)
+        
+        if not deals:
             await update.message.reply_text(
-                f"ℹ️ No release history found for {origin} → {destination} in the database.",
-                parse_mode=ParseMode.HTML
+                f"🔍 No deals found{' for ' + cabin_name if cabin_filter else ''}.\n"
+                f"The cache might be empty. Try again after the next scan!",
+                parse_mode="Markdown"
             )
             return
-
-        message = f"📜 <b>Release History: {origin} → {destination}</b>\n\n"
-        message += "<i>When seats were first detected:</i>\n\n"
-
-        for date, cabin, seats, first_seen in history:
-            class_name = SASAwardAPI.CABIN_CODES.get(cabin, cabin)
-            emoji = CABIN_CLASSES.get(cabin, {}).get("emoji", "✈️")
+        
+        # Build the message
+        header = f"🔥 *Hot Deals* — {cabin_name}\n"
+        header += f"_Top routes with most availability right now_\n\n"
+        
+        lines = []
+        for i, deal in enumerate(deals, 1):
+            cabin_emoji = {"AG": "💺", "AP": "⭐", "AB": "💼"}.get(deal["cabin"], "✈️")
+            cabin_text = {"AG": "Eco", "AP": "Prem", "AB": "Biz"}.get(deal["cabin"], deal["cabin"])
             
-            # Format first_seen
-            try:
-                fs_dt = datetime.strptime(first_seen, "%Y-%m-%d %H:%M:%S")
-                fs_display = fs_dt.strftime("%b %d, %H:%M")
-            except:
-                fs_display = first_seen
-
-            message += f"📅 <b>{date}</b>\n"
-            message += f"  {emoji} {class_name}: {seats} seats\n"
-            message += f"  ⏰ Detected: {fs_display}\n\n"
-
-        await update.message.reply_text(message, parse_mode=ParseMode.HTML)
-    finally:
-        adb.close()
-
-
-async def best_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /best command."""
-    db_path = context.bot_data.get("db_path", "sas_monitor.db")
-
-    from sas_monitor import AvailabilityDatabase
-    adb = AvailabilityDatabase(db_path)
-
-    try:
-        best_bets = adb.get_best_bets(limit=15)
-        if not best_bets:
-            await update.message.reply_text(
-                "ℹ️ No Business Class availability found in the database.",
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        message = "💎 <b>Best Bets: Business Class (AB)</b>\n"
-        message += "<i>Routes with most current availability:</i>\n\n"
-
-        for origin, destination, date, seats in best_bets:
-            message += f"💼 <b>{origin} → {destination}</b>\n"
-            message += f"  📅 {date}: <b>{seats}</b> seats\n\n"
-
-        booking_url = "https://www.sas.no/award-finder"
-        message += f'<a href="{booking_url}">🔗 Go to SAS Award Finder</a>'
-
-        await update.message.reply_text(message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    finally:
-        adb.close()
-
-
-async def notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /notify command - subscribe to notifications."""
-    user = update.effective_user
-    chat_id = str(update.effective_chat.id)
-    db_path = context.bot_data.get("db_path", "sas_monitor.db")
-
-    from sas_monitor import AvailabilityDatabase
-    adb = AvailabilityDatabase(db_path)
-
-    try:
-        # Check if already subscribed
-        if adb.is_subscribed(chat_id):
-            await update.message.reply_text(
-                "✅ <b>You're already subscribed!</b>\n\n"
-                "You'll receive instant notifications when:\n"
-                "🎉 New tickets are released\n"
-                "📈 Seats increase\n"
-                "📉 Seats decrease (being booked)\n"
-                "💨 Tickets sell out\n\n"
-                "Use /unsubscribe to stop notifications.",
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        # Subscribe the user
-        success = adb.add_subscriber(
-            chat_id=chat_id,
-            username=user.username,
-            first_name=user.first_name
-        )
-
-        if success:
-            subscriber_count = adb.get_subscriber_count()
-            await update.message.reply_text(
-                "🔔 <b>Subscribed successfully!</b>\n\n"
-                "You'll now receive instant notifications for:\n"
-                "• 🎉 New ticket releases\n"
-                "• 📈 Seat increases\n"
-                "• 📉 Seat decreases\n"
-                "• 💨 Sold out alerts\n\n"
-                f"Total subscribers: {subscriber_count}\n\n"
-                "Use /unsubscribe anytime to stop notifications.",
-                parse_mode=ParseMode.HTML
-            )
-            logger.info(f"New subscriber: {user.username or chat_id} ({subscriber_count} total)")
-        else:
-            await update.message.reply_text(
-                "❌ Failed to subscribe. Please try again later.",
-                parse_mode=ParseMode.HTML
-            )
-    finally:
-        adb.close()
-
-
-async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /unsubscribe command - unsubscribe from notifications."""
-    user = update.effective_user
-    chat_id = str(update.effective_chat.id)
-    db_path = context.bot_data.get("db_path", "sas_monitor.db")
-
-    from sas_monitor import AvailabilityDatabase
-    adb = AvailabilityDatabase(db_path)
-
-    try:
-        # Check if subscribed
-        if not adb.is_subscribed(chat_id):
-            await update.message.reply_text(
-                "ℹ️ <b>You're not subscribed</b>\n\n"
-                "You're not receiving notifications.\n"
-                "Use /notify to subscribe.",
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        # Unsubscribe the user
-        success = adb.remove_subscriber(chat_id)
-
-        if success:
-            subscriber_count = adb.get_subscriber_count()
-            await update.message.reply_text(
-                "🔕 <b>Unsubscribed successfully</b>\n\n"
-                "You won't receive any more notifications.\n\n"
-                f"Remaining subscribers: {subscriber_count}\n\n"
-                "You can re-subscribe anytime with /notify",
-                parse_mode=ParseMode.HTML
-            )
-            logger.info(f"User unsubscribed: {user.username or chat_id} ({subscriber_count} remaining)")
-        else:
-            await update.message.reply_text(
-                "❌ Failed to unsubscribe. Please try again later.",
-                parse_mode=ParseMode.HTML
-            )
-    finally:
-        adb.close()
-
-
-async def sales_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /sales command - show fastest-selling tickets history."""
-    db_path = context.bot_data.get("db_path", "sas_monitor.db")
-
-    from sas_monitor import AvailabilityDatabase
-    adb = AvailabilityDatabase(db_path)
-
-    try:
-        fastest = adb.get_fastest_selling_tickets(limit=15)
-
-        if not fastest:
-            await update.message.reply_text(
-                "ℹ️ No sales history available yet.\n\n"
-                "Tickets need to sell out completely to appear here.",
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        message = "📊 <b>FASTEST SELLING TICKETS</b>\n\n"
-        message += "<i>Tickets that sold out quickest:</i>\n\n"
-
-        for idx, (origin, destination, date, cabin, duration_hours,
-                  max_seats, avg_velocity, sold_out_at) in enumerate(fastest, 1):
-            dest_name = AIRPORT_NAMES.get(destination, destination)
-            class_name = CABIN_CLASSES.get(cabin, {}).get("name", cabin)
-
-            # Format duration
-            if duration_hours < 24:
-                duration_str = f"{duration_hours:.1f} hours"
-            else:
-                days = int(duration_hours / 24)
-                hours = int(duration_hours % 24)
-                duration_str = f"{days}d {hours}h"
-
-            # Determine fire emoji intensity based on velocity
-            if avg_velocity >= 1.5:
-                fire = "🔥🔥🔥"
-            elif avg_velocity >= 1.0:
-                fire = "🔥🔥"
-            elif avg_velocity >= 0.5:
-                fire = "🔥"
-            else:
-                fire = ""
-
-            # Format sold out time
-            try:
-                sold_dt = datetime.strptime(sold_out_at, "%Y-%m-%d %H:%M:%S")
-                sold_display = sold_dt.strftime("%b %d, %H:%M")
-            except:
-                sold_display = sold_out_at
-
-            message += f"{idx}. <b>{origin} → {dest_name}</b> {date}\n"
-            message += f"   💺 {class_name}: {max_seats} seats total\n"
-            message += f"   ⏱️ Sold out in: <b>{duration_str}</b>\n"
-            if avg_velocity > 0:
-                message += f"   ⚡ {avg_velocity:.1f} seats/hour {fire}\n"
-            message += f"   🕐 Sold: {sold_display}\n\n"
-
-        message += "<i>These tickets sold out completely from first discovery.</i>"
-
-        await update.message.reply_text(message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    finally:
-        adb.close()
-
-
-async def velocity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /velocity command - show hottest tickets (fastest booking)."""
-    db_path = context.bot_data.get("db_path", "sas_monitor.db")
-
-    from sas_monitor import AvailabilityDatabase
-    adb = AvailabilityDatabase(db_path)
-
-    try:
-        hot_tickets = adb.get_hot_tickets(limit=15)
-
-        if not hot_tickets:
-            await update.message.reply_text(
-                "ℹ️ No booking velocity data available yet.\n\n"
-                "Velocity tracking requires at least one seat decrease event.",
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        message = "🔥 <b>HOTTEST TICKETS (Booking Fast!)</b>\n\n"
-        message += "<i>Routes with highest booking velocity:</i>\n\n"
-
-        for idx, (origin, destination, date, cabin, direction, curr_avail,
-                  total_booked, velocity) in enumerate(hot_tickets, 1):
-            dest_name = AIRPORT_NAMES.get(destination, destination)
-            class_name = CABIN_CLASSES.get(cabin, {}).get("name", cabin)
-            direction_emoji = "→" if direction == "outbound" else "←"
-
-            # Determine fire emoji intensity
-            if velocity >= 1.5:
-                fire = "🔥🔥🔥"
-            elif velocity >= 1.0:
-                fire = "🔥🔥"
-            elif velocity >= 0.5:
-                fire = "🔥"
-            else:
-                fire = ""
-
-            message += f"{idx}. <b>{origin} {direction_emoji} {dest_name}</b> {date}\n"
-            message += f"   💺 {class_name}: {curr_avail} left ({total_booked} booked)\n"
-            message += f"   ⚡ <b>{velocity:.1f} seats/hour</b> {fire}\n\n"
-
-        message += '<a href="https://www.sas.no/award-finder">🔗 Book now on SAS</a>'
-
-        await update.message.reply_text(message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    finally:
-        adb.close()
-
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /stats command - enhanced status with tracking statistics."""
-    db_path = context.bot_data.get("db_path", "sas_monitor.db")
-
-    from sas_monitor import AvailabilityDatabase
-    adb = AvailabilityDatabase(db_path)
-
-    try:
-        stats = adb.get_stats()
-
-        # Format last scraped time
-        last_scraped = stats.get("last_scraped", "Never")
-        if last_scraped and last_scraped != "Never":
-            try:
-                ls_dt = datetime.strptime(last_scraped, "%Y-%m-%d %H:%M:%S")
-                last_scraped = ls_dt.strftime("%b %d, %H:%M:%S UTC")
-            except:
-                pass
-
-        message = "📊 <b>System Statistics Dashboard</b>\n\n"
-        message += "🕐 <b>Last Scan:</b> " + last_scraped + "\n"
-        message += f"📁 <b>Total Snapshots:</b> {stats.get('total_records', 0):,}\n"
-        message += f"🛤️ <b>Unique Routes:</b> {stats.get('unique_routes', 0)}\n"
-        message += f"🎫 <b>Tracked Tickets:</b> {stats.get('tracked_tickets', 0):,}\n"
-        message += f"📋 <b>Baseline Tickets:</b> {stats.get('baseline_tickets', 0):,}\n"
-        message += f"📨 <b>Notifications Sent:</b> {stats.get('notifications_sent', 0)}\n"
-
-        # Get hot tickets count
-        hot_tickets = adb.get_hot_tickets(limit=100)
-        hot_count = len([t for t in hot_tickets if t[7] >= 0.5])  # velocity >= 0.5 (index 7 now includes direction)
-        if hot_count > 0:
-            message += f"\n🔥 <b>Hot Tickets:</b> {hot_count} (booking fast)\n"
-
-        message += "\n✅ <i>Monitor is running</i>\n"
-        message += "\n<b>Commands:</b>\n"
-        message += "/tickets - View all tracked tickets\n"
-        message += "/velocity - See hottest tickets\n"
-        message += "/best - Best business class availability"
-
-        await update.message.reply_text(message, parse_mode=ParseMode.HTML)
-    finally:
-        adb.close()
-
-
-async def catalogue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle /catalogue command - browse all tracked tickets with clean format.
-    Shows: current availability, max issued, and recent changes.
-    """
-    db_path = context.bot_data.get("db_path", "sas_monitor.db")
-
-    from sas_monitor import AvailabilityDatabase
-    adb = AvailabilityDatabase(db_path)
-
-    try:
-        # Get all tracked tickets with change history
-        tickets = adb.get_route_summary_with_changes()
-
-        if not tickets:
-            await update.message.reply_text(
-                "ℹ️ No tracked tickets found.\n\n"
-                "The monitor needs to run at least once to populate the catalogue.",
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        # Group by route, direction, then by date
-        by_route = {}
-        for t in tickets:
-            route_key = (t['origin'], t['destination'], t['direction'])
-            if route_key not in by_route:
-                by_route[route_key] = {}
-
-            date = t['date']
-            if date not in by_route[route_key]:
-                by_route[route_key][date] = {}
-
-            by_route[route_key][date][t['cabin_class']] = t
-
-        # Build message with new clean format
-        message = "📚 <b>TICKET CATALOGUE</b>\n\n"
-
-        route_count = 0
-        for (origin, destination, direction), dates in sorted(by_route.items()):
-            if route_count >= 5:  # Limit to 5 routes
-                break
-            route_count += 1
-
-            dest_name = AIRPORT_NAMES.get(destination, destination)
-            direction_emoji = "→" if direction == "outbound" else "←"
-            direction_text = f" ({direction})" if direction else ""
-            message += f"✈️ <b>{origin} {direction_emoji} {dest_name}</b>{direction_text}\n"
-
-            date_count = 0
-            for date, cabins in sorted(dates.items()):
-                if date_count >= 3:  # Limit to 3 dates per route
-                    break
-                date_count += 1
-
-                # Format date nicely
-                try:
-                    date_obj = datetime.strptime(date, "%Y-%m-%d")
-                    date_display = date_obj.strftime("%b %d, %Y")
-                except:
-                    date_display = date
-
-                message += f"📅 <b>{date_display}</b>\n"
-
-                # Collect cabin info for this date
-                cabin_parts = []
-                has_bookings = False
-                
-                for cabin_code in ["AB", "AP", "AG"]:
-                    if cabin_code in cabins:
-                        t = cabins[cabin_code]
-                        emoji = CABIN_CLASSES.get(cabin_code, {}).get("emoji", "✈️")
-                        curr = t['currently_available']
-                        max_seats = t['max_issued']
-                        booked = max_seats - curr
-                        
-                        if curr == 0 and max_seats > 0:
-                            # Sold out
-                            cabin_parts.append(f"  {emoji} 0/{max_seats} ❌")
-                            has_bookings = True
-                        elif booked > 0:
-                            # Some booked
-                            cabin_parts.append(f"  {emoji} {curr}/{max_seats} (-{booked})")
-                            has_bookings = True
-                        else:
-                            # No bookings yet - simple format
-                            cabin_parts.append(f"  {emoji} {curr}")
-                
-                message += "\n".join(cabin_parts) + "\n"
-                
-                # Show recent DECREASES only (filter out positive baseline changes)
-                all_decreases = []
-                for cabin_code, t in cabins.items():
-                    for change in t.get('changes', []):
-                        # change = (changed_at, cabin, prev, new, amount, change_type)
-                        if change[4] < 0:  # Only negative changes (bookings)
-                            all_decreases.append((change, cabin_code))
-                
-                if all_decreases:
-                    # Sort by time (most recent first) and take top 3
-                    all_decreases.sort(key=lambda x: x[0][0], reverse=True)
-                    recent = all_decreases[:3]
-                    
-                    change_strs = []
-                    for (changed_at, cabin, prev, new, amount, change_type), cabin_code in recent:
-                        emoji = CABIN_CLASSES.get(cabin_code, {}).get("emoji", "")
-                        try:
-                            dt = datetime.strptime(changed_at, "%Y-%m-%d %H:%M:%S")
-                            time_str = dt.strftime("%H:%M")
-                        except:
-                            time_str = changed_at
-                        
-                        change_strs.append(f"{amount}{emoji} {time_str}")
-                    
-                    if change_strs:
-                        message += f"  📉 {', '.join(change_strs)}\n"
-                
-                message += "\n"
+            route = f"{deal['origin']} → {deal['destination']}"
             
-            message += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        
-        # Add remaining routes count
-        remaining = len(by_route) - route_count
-        if remaining > 0:
-            message += f"<i>...and {remaining} more routes</i>\n\n"
-        
-        message += '<a href="https://www.sas.no/award-finder">🔗 Book on SAS</a>'
-
-        await update.message.reply_text(
-            message,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True
-        )
-    finally:
-        adb.close()
-
-
-def build_catalogue_page(tickets: list, page: int = 0, sort_by: str = "recent", filter_type: str = "all") -> tuple:
-    """
-    Build a page of the catalogue with navigation buttons.
-
-    Args:
-        tickets: List of ticket tuples from get_all_tracked_tickets()
-        page: Page number (0-indexed)
-        sort_by: Sort method (recent, availability, date, route)
-        filter_type: Filter (all, available, sold_out)
-
-    Returns:
-        Tuple of (message, keyboard)
-    """
-    ITEMS_PER_PAGE = 5  # Routes per page
-
-    # Apply filter - now index 6 is currently_available (after adding direction at index 4)
-    if filter_type == "available":
-        filtered_tickets = [t for t in tickets if t[6] > 0]  # currently_available > 0
-    elif filter_type == "sold_out":
-        filtered_tickets = [t for t in tickets if t[6] == 0]  # currently_available == 0
-    else:
-        filtered_tickets = tickets
-
-    # Apply sort - indices updated for direction column
-    if sort_by == "recent":
-        sorted_tickets = sorted(filtered_tickets, key=lambda x: x[8], reverse=True)  # first_seen_at desc
-    elif sort_by == "availability":
-        sorted_tickets = sorted(filtered_tickets, key=lambda x: (x[5], x[6]), reverse=True)  # max_issued, currently_available desc
-    elif sort_by == "date":
-        sorted_tickets = sorted(filtered_tickets, key=lambda x: x[2])  # date asc
-    elif sort_by == "route":
-        sorted_tickets = sorted(filtered_tickets, key=lambda x: (x[0], x[1], x[4], x[2]))  # origin, destination, direction, date
-    else:
-        sorted_tickets = filtered_tickets
-
-    # Group by route and direction
-    by_route = {}
-    for ticket in sorted_tickets:
-        route_key = (ticket[0], ticket[1], ticket[4])  # (origin, destination, direction)
-        if route_key not in by_route:
-            by_route[route_key] = []
-        by_route[route_key].append(ticket)
-
-    total_routes = len(by_route)
-    total_pages = max(1, (total_routes + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
-    page = max(0, min(page, total_pages - 1))  # Clamp page
-
-    # Get routes for this page
-    route_items = list(by_route.items())
-    start_idx = page * ITEMS_PER_PAGE
-    end_idx = min(start_idx + ITEMS_PER_PAGE, total_routes)
-    page_routes = route_items[start_idx:end_idx]
-
-    # Build message header
-    sort_names = {
-        "recent": "Recent Discovery",
-        "availability": "Availability",
-        "date": "Flight Date",
-        "route": "Route"
-    }
-    filter_names = {
-        "all": "All",
-        "available": "Available Only",
-        "sold_out": "Sold Out"
-    }
-
-    message = f"📚 <b>TICKET CATALOGUE</b>\n\n"
-    message += f"Total: {len(filtered_tickets)} tickets across {total_routes} routes\n"
-    message += f"Sort: {sort_names.get(sort_by, sort_by)} | Filter: {filter_names.get(filter_type, filter_type)}\n"
-    message += f"Page {page + 1}/{total_pages}\n\n"
-
-    # Build routes display
-    for (origin, destination, direction), route_tickets in page_routes:
-        dest_name = AIRPORT_NAMES.get(destination, destination)
-        direction_emoji = "→" if direction == "outbound" else "←"
-        message += f"✈️ <b>{origin} {direction_emoji} {dest_name}</b> ({direction}, {len(route_tickets)} tickets)\n"
-
-        # Group by date
-        by_date = {}
-        for t in route_tickets:
-            if t[2] not in by_date:
-                by_date[t[2]] = []
-            by_date[t[2]].append(t)
-
-        for date in sorted(by_date.keys())[:3]:  # Show max 3 dates per route
-            message += f"  📅 {date}\n"
-            for t in by_date[date]:
-                cabin = t[3]
-                class_name = CABIN_CLASSES.get(cabin, {}).get("name", cabin)
-                emoji = CABIN_CLASSES.get(cabin, {}).get("emoji", "✈️")
-                max_issued = t[5]  # Updated index
-                curr_avail = t[6]  # Updated index
-                total_booked = t[7]  # Updated index
-
-                if curr_avail > 0:
-                    message += f"    {emoji} {class_name}: {curr_avail} avail ({max_issued} total, {total_booked} booked)\n"
-                else:
-                    message += f"    {emoji} {class_name}: SOLD OUT ({max_issued} total)\n"
-
-        message += "\n"
-
-    # Build keyboard
-    keyboard = []
-
-    # Sorting buttons (row 1)
-    sort_row = [
-        InlineKeyboardButton("🕐 Recent" + (" ✓" if sort_by == "recent" else ""),
-                           callback_data=f"cat:0:recent:{filter_type}"),
-        InlineKeyboardButton("💺 Avail" + (" ✓" if sort_by == "availability" else ""),
-                           callback_data=f"cat:0:availability:{filter_type}"),
-        InlineKeyboardButton("📅 Date" + (" ✓" if sort_by == "date" else ""),
-                           callback_data=f"cat:0:date:{filter_type}"),
-    ]
-    keyboard.append(sort_row)
-
-    # Filter buttons (row 2)
-    filter_row = [
-        InlineKeyboardButton("All" + (" ✓" if filter_type == "all" else ""),
-                           callback_data=f"cat:0:{sort_by}:all"),
-        InlineKeyboardButton("Available" + (" ✓" if filter_type == "available" else ""),
-                           callback_data=f"cat:0:{sort_by}:available"),
-        InlineKeyboardButton("Sold Out" + (" ✓" if filter_type == "sold_out" else ""),
-                           callback_data=f"cat:0:{sort_by}:sold_out"),
-    ]
-    keyboard.append(filter_row)
-
-    # Navigation buttons (row 3)
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton("⬅️ Previous",
-                                           callback_data=f"cat:{page-1}:{sort_by}:{filter_type}"))
-    if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton("Next ➡️",
-                                           callback_data=f"cat:{page+1}:{sort_by}:{filter_type}"))
-    if nav_row:
-        keyboard.append(nav_row)
-
-    return message.strip(), keyboard
-
-
-def build_alerts_page(notifications: list, page: int = 0,
-                     filter_type: str = "all") -> tuple:
-    """
-    Build a paginated alerts history page.
-
-    Args:
-        notifications: List of notification tuples from DB
-        page: Current page number (0-indexed)
-        filter_type: Filter applied ('all', 'new', 'vanished', etc.)
-
-    Returns:
-        (message_text, keyboard_buttons)
-    """
-    from datetime import datetime
-
-    ITEMS_PER_PAGE = 10
-
-    # Calculate pagination
-    total_items = len(notifications)
-    total_pages = max(1, (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
-    page = max(0, min(page, total_pages - 1))
-
-    start_idx = page * ITEMS_PER_PAGE
-    end_idx = min(start_idx + ITEMS_PER_PAGE, total_items)
-    page_items = notifications[start_idx:end_idx]
-
-    # Build header
-    filter_names = {
-        "all": "All Notifications",
-        "new": "New Tickets",
-        "vanished": "Vanished Tickets",
-        "increase": "Seat Increases",
-        "decrease": "Seat Decreases"
-    }
-
-    message = f"📨 <b>Notification History</b>\n"
-    message += f"Filter: {filter_names.get(filter_type, 'All')}\n"
-    message += f"Page {page + 1}/{total_pages} ({total_items} total)\n\n"
-
-    if not page_items:
-        message += "No notifications found."
-        return message, []
-
-    # Build notification list
-    for i, notif in enumerate(page_items, start=start_idx + 1):
-        notif_id, sent_at, origin, destination, date, cabin, seats, msg_preview = notif
-
-        # Parse timestamp
-        try:
-            dt = datetime.strptime(sent_at, "%Y-%m-%d %H:%M:%S")
-            time_str = dt.strftime("%b %d, %H:%M")
-        except:
-            time_str = sent_at
-
-        # Detect notification type from message
-        if "NEW TICKETS" in msg_preview:
-            emoji = "🎉"
-        elif "TICKETS GONE" in msg_preview:
-            emoji = "💨"
-        elif "SEATS BEING BOOKED" in msg_preview:
-            emoji = "📉"
-        else:
-            emoji = "📨"
-
-        # Show timestamp and message preview
-        message += f"{emoji} <b>{time_str}</b>\n"
-
-        # Clean up and show the message content
-        # Remove HTML tags for cleaner display
-        preview = msg_preview.replace("<b>", "").replace("</b>", "")
-        preview = preview.replace("<i>", "").replace("</i>", "")
-        preview = preview.replace("\n\n", "\n")  # Reduce double newlines
-
-        # Show the preview with indentation
-        lines = preview.split('\n')
-        for line in lines[:4]:  # Show first 4 lines
-            line = line.strip()
-            if line:
-                message += f"   {line}\n"
-
-        message += "\n"
-
-    # Build keyboard
-    keyboard = []
-
-    # Filter buttons row
-    filter_row = []
-    for f_type, f_name in [("all", "All"), ("new", "New"), ("vanished", "Gone"),
-                           ("increase", "Incr"), ("decrease", "Decr")]:
-        checkmark = "✓ " if f_type == filter_type else ""
-        filter_row.append(InlineKeyboardButton(
-            f"{checkmark}{f_name}",
-            callback_data=f"alerts:{page}:{f_type}"
-        ))
-    keyboard.append(filter_row)
-
-    # Navigation row
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton("< Prev", callback_data=f"alerts:{page-1}:{filter_type}"))
-    if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton("Next >", callback_data=f"alerts:{page+1}:{filter_type}"))
-
-    if nav_row:
-        keyboard.append(nav_row)
-
-    # Close button
-    keyboard.append([InlineKeyboardButton("❌ Close", callback_data="close")])
-
-    return message, keyboard
-
-
-async def tickets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle /tickets command - show all tracked tickets with historical max.
-    Usage:
-        /tickets              → All tracked tickets
-        /tickets OSL-BKK      → Specific route
-        /tickets OSL-BKK 2026-02 → Route + month filter
-    """
-    query_text = update.message.text
-    args = query_text.split()[1:]  # Skip command
-
-    origin = dest = month = None
-
-    if len(args) >= 1:
-        parts = args[0].split('-')
-        if len(parts) == 2:
-            origin, dest = parts[0].upper(), parts[1].upper()
-
-    if len(args) >= 2:
-        month = args[1].replace('-', '')  # Convert 2026-02 to 202602
-
-    db_path = context.bot_data.get("db_path", "sas_monitor.db")
-
-    from sas_monitor import AvailabilityDatabase
-    adb = AvailabilityDatabase(db_path)
-
-    try:
-        tickets = adb.get_all_tracked_tickets(origin, dest, month)
-
-        if not tickets:
-            filter_text = ""
-            if origin and dest:
-                filter_text = f" for {origin} → {dest}"
-            if month:
-                filter_text += f" ({month[:4]}-{month[4:]})"
-
-            await update.message.reply_text(
-                f"ℹ️ No tracked tickets found{filter_text}.",
-                parse_mode=ParseMode.HTML
+            # Format date summary
+            if deal["upcoming_dates"]:
+                date_str = ", ".join([d[5:] for d in deal["upcoming_dates"][:3]])  # Show MM-DD
+                if len(deal["upcoming_dates"]) > 3:
+                    date_str += f" +{len(deal['upcoming_dates']) - 3} more"
+            else:
+                date_str = "No upcoming dates"
+            
+            line = (
+                f"{i}. *{route}* ({cabin_emoji} {cabin_text})\n"
+                f"   📅 {deal['date_count']} dates, 💺 {deal['total_seats']} total seats\n"
+                f"   🗓 _{date_str}_"
             )
-            return
-
-        # Group by route and direction
-        by_route = {}
-        for (orig, destination, date, cabin, direction, max_issued, curr_avail,
-             total_booked, first_seen, velocity) in tickets:
-            route_key = (orig, destination, direction)
-            if route_key not in by_route:
-                by_route[route_key] = []
-            by_route[route_key].append({
-                'date': date,
-                'cabin': cabin,
-                'max_issued': max_issued,
-                'currently_available': curr_avail,
-                'total_booked': total_booked,
-                'first_seen': first_seen,
-                'velocity': velocity
-            })
-
-        message = f"🎫 <b>Tracked Tickets ({len(tickets)} total)</b>\n\n"
-
-        for (orig, destination, direction), route_tickets in sorted(by_route.items())[:10]:  # Limit to 10 routes
-            dest_name = AIRPORT_NAMES.get(destination, destination)
-            direction_emoji = "→" if direction == "outbound" else "←"
-            message += f"✈️ <b>{orig} {direction_emoji} {dest_name}</b> ({direction})\n\n"
-
-            # Group by date
-            by_date = {}
-            for t in route_tickets:
-                if t['date'] not in by_date:
-                    by_date[t['date']] = []
-                by_date[t['date']].append(t)
-
-            for date in sorted(by_date.keys())[:5]:  # Limit to 5 dates per route
-                message += f"📅 <b>{date}</b>\n"
-                for t in by_date[date]:
-                    class_name = CABIN_CLASSES.get(t['cabin'], {}).get("name", t['cabin'])
-                    emoji = CABIN_CLASSES.get(t['cabin'], {}).get("emoji", "✈️")
-
-                    if t['currently_available'] > 0:
-                        message += f"  {emoji} {class_name}: <b>{t['currently_available']}</b> available "
-                        message += f"({t['max_issued']} total, {t['total_booked']} booked)\n"
-
-                        # Add velocity if hot
-                        if t['velocity'] and t['velocity'] > 0.3:
-                            if t['velocity'] >= 1.0:
-                                fire = "🔥🔥"
-                            else:
-                                fire = "🔥"
-                            message += f"     ⚡ {t['velocity']:.1f} seats/hr {fire}\n"
-                    else:
-                        message += f"  {emoji} {class_name}: <b>SOLD OUT</b> "
-                        message += f"({t['max_issued']} total, all booked)\n"
-
-                    # First seen
-                    try:
-                        fs_dt = datetime.strptime(t['first_seen'], "%Y-%m-%d %H:%M:%S")
-                        fs_display = fs_dt.strftime("%b %d, %H:%M")
-                        message += f"     🕐 First seen: {fs_display}\n"
-                    except:
-                        pass
-
-                message += "\n"
-
-            message += "---\n\n"
-
-        if len(by_route) > 10:
-            message += f"<i>Showing 10 of {len(by_route)} routes. Use filters to narrow results.</i>\n\n"
-
-        message += '<a href="https://www.sas.no/award-finder">🔗 Book on SAS</a>'
-
-        await update.message.reply_text(message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    finally:
-        adb.close()
-
-
-async def calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /calendar command - show emoji grid of monthly availability."""
-    query_text = update.message.text
-    parsed = parse_route(query_text)
-
-    if not parsed:
-        await update.message.reply_text(
-            "❌ <b>Invalid format</b>\nUse: <code>/calendar OSL BKK</code> or <code>/calendar OSL BKK March</code>",
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    origin, destination, month = parsed
-    api: SASAwardAPI = context.bot_data.get("api")
-
-    if not api:
-        await update.message.reply_text("❌ API not initialized", parse_mode=ParseMode.HTML)
-        return
-
-    # Fetch data
-    data = api.get_availability(origin=origin, destination=destination, month=month or "")
-
-    if not data:
-        await update.message.reply_text(
-            f"ℹ️ No data found for {origin} → {destination}",
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    dest_data = data[0]
-    city_name = dest_data.get("cityName", destination)
-
-    # Build calendar grid
-    message = f"📅 <b>Calendar: {origin} → {city_name}</b>\n\n"
-    message += "<b>Legend:</b> 🟥 None | 💺 Economy | ⭐ Premium | 💎 Business\n\n"
-
-    for direction_key, direction_label in [("outbound", "OUTBOUND"), ("inbound", "RETURN")]:
-        direction_data = dest_data.get("availability", {}).get(direction_key, [])
-        if not direction_data:
-            continue
-
-        message += f"<b>{direction_label}:</b>\n"
+            lines.append(line)
         
-        # Group by month
-        by_month = {}
-        for avail in sorted(direction_data, key=lambda x: x.get("date", "")):
-            date = avail.get("date", "")
-            if not date:
+        # Add footer with tips
+        footer = (
+            "\n\n💡 *Tips:*\n"
+            "• `/deals business` — Business class only\n"
+            "• `/search OSL-BKK` — Search specific route\n"
+            "• `/subscribe OSL BKK` — Get alerts"
+        )
+        
+        message = header + "\n".join(lines) + footer
+        
+        await update.message.reply_text(message, parse_mode="Markdown")
+
+    # =========================================================================
+    # SEARCH FUNCTIONALITY - PHASE 2 & 3
+    # =========================================================================
+
+    def _parse_search_query(self, args: List[str]) -> Dict[str, Any]:
+        """Parse search query arguments into structured data."""
+        result = {
+            "origin": None,
+            "destination": None,
+            "month": None,
+            "cabin_filter": None,
+            "direct_only": False,
+            "cheapest_mode": False,
+            "multi_dest": False,  # OSL-* or *-BKK
+            "points_budget": None,
+            "saver_only": False,  # Only bonus/saver tickets
+            "error": None
+        }
+
+        if not args:
+            result["error"] = (
+                "Usage:\n"
+                "`/search OSL-BKK` - Search route\n"
+                "`/search OSL-*` - All destinations\n"
+                "`/search OSL-BKK cheap` - Find cheapest\n"
+                "`/search OSL-* 50000pts` - Budget search"
+            )
+            return result
+
+        query = " ".join(args).upper()
+
+        # Check for multi-destination pattern (OSL-* or *-BKK)
+        multi_match = re.match(r"([A-Z]{3}|\*)\s*[-\s]+\s*([A-Z]{3}|\*)", query)
+        if multi_match:
+            origin = multi_match.group(1)
+            dest = multi_match.group(2)
+
+            if origin == "*" and dest == "*":
+                result["error"] = "Cannot use * for both origin and destination"
+                return result
+
+            if origin == "*" or dest == "*":
+                result["multi_dest"] = True
+
+            result["origin"] = origin if origin != "*" else None
+            result["destination"] = dest if dest != "*" else None
+        else:
+            # Standard route pattern
+            route_match = re.match(r"([A-Z]{3})\s*[-\s]+\s*([A-Z]{3})", query)
+            if not route_match:
+                result["error"] = "Invalid route format. Use: `/search OSL-BKK` or `/search OSL-*`"
+                return result
+            result["origin"] = route_match.group(1)
+            result["destination"] = route_match.group(2)
+
+        # Extract remaining arguments
+        remaining = query[multi_match.end() if multi_match else 0:].strip()
+        if multi_match:
+            remaining = query[multi_match.end():].strip()
+
+        tokens = remaining.split()
+
+        month_names = {
+            "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
+            "MAY": "05", "JUN": "06", "JUL": "07", "AUG": "08",
+            "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12",
+            "JANUARY": "01", "FEBRUARY": "02", "MARCH": "03", "APRIL": "04",
+            "JUNE": "06", "JULY": "07", "AUGUST": "08",
+            "SEPTEMBER": "09", "OCTOBER": "10", "NOVEMBER": "11", "DECEMBER": "12"
+        }
+        cabin_keywords = {"ECONOMY", "PREMIUM", "BUSINESS", "ECO", "BIZ", "PREM"}
+
+        for token in tokens:
+            # Check for points budget (e.g., "50000PTS", "50KPTS", "50000")
+            pts_match = re.match(r"(\d+)(K)?(PTS)?", token)
+            if pts_match and (pts_match.group(3) or pts_match.group(2)):
+                points = int(pts_match.group(1))
+                if pts_match.group(2):  # "K" suffix
+                    points *= 1000
+                result["points_budget"] = points
                 continue
-            month_key = date[:7]  # YYYY-MM
-            if month_key not in by_month:
-                by_month[month_key] = []
-            
-            # Determine best class available
-            if avail.get("AB", 0) > 0:
-                by_month[month_key].append("💎")
-            elif avail.get("AP", 0) > 0:
-                by_month[month_key].append("⭐")
-            elif avail.get("AG", 0) > 0:
-                by_month[month_key].append("💺")
-            else:
-                by_month[month_key].append("🟥")
 
-        for month_name, emojis in by_month.items():
-            message += f"<code>{month_name}:</code> {''.join(emojis)}\n"
+            # Check for month
+            if token in month_names:
+                month_num = month_names[token]
+                now = datetime.now()
+                year = now.year if int(month_num) >= now.month else now.year + 1
+                result["month"] = f"{year}{month_num}"
+            # Check for cabin
+            elif token in cabin_keywords:
+                if token == "ECO":
+                    result["cabin_filter"] = "ECONOMY"
+                elif token == "BIZ":
+                    result["cabin_filter"] = "BUSINESS"
+                elif token == "PREM":
+                    result["cabin_filter"] = "PREMIUM"
+                else:
+                    result["cabin_filter"] = token
+            # Check for direct
+            elif token == "DIRECT":
+                result["direct_only"] = True
+            # Check for cheap mode
+            elif token in ("CHEAP", "CHEAPEST", "LOWEST"):
+                result["cheapest_mode"] = True
+            # Check for bonus/saver mode
+            elif token in ("BONUS", "SAVER"):
+                result["saver_only"] = True
 
-        message += "\n"
+        return result
 
-    await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+    async def search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Search for award flights with calendar view."""
+        chat_id = str(update.effective_chat.id)
 
-
-async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle /alerts command - view notification history with pagination.
-    """
-    db_path = context.bot_data.get("db_path", "sas_monitor.db")
-
-    from sas_monitor import AvailabilityDatabase
-    adb = AvailabilityDatabase(db_path)
-
-    try:
-        # Get all notifications (will paginate in UI)
-        notifications = adb.get_notification_history(limit=100, offset=0, filter_type="all")
-
-        if not notifications:
-            await update.message.reply_text(
-                "📨 No notifications found.\n\n"
-                "Notifications will appear here after the monitor detects changes "
-                "and sends alerts.",
-                parse_mode=ParseMode.HTML
-            )
+        parsed = self._parse_search_query(context.args)
+        if parsed["error"]:
+            await update.message.reply_text(parsed["error"], parse_mode="Markdown")
             return
 
-        # Build first page
-        message, keyboard = build_alerts_page(notifications, page=0, filter_type="all")
+        # Dispatch to appropriate search handler
+        if parsed["multi_dest"]:
+            await self._search_multi_destination(update, chat_id, parsed)
+        elif parsed["cheapest_mode"]:
+            await self._search_cheapest(update, chat_id, parsed)
+        elif parsed["saver_only"]:
+            await self._search_bonus(update, chat_id, parsed)
+        else:
+            await self._search_calendar(update, chat_id, parsed)
 
-        await update.message.reply_text(
-            message,
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(keyboard)
+    async def _search_calendar(self, update: Update, chat_id: str, parsed: Dict):
+        """Standard calendar search for a specific route."""
+        origin = parsed["origin"]
+        destination = parsed["destination"]
+        month_filter = parsed["month"]
+        cabin_filter = parsed["cabin_filter"]
+        direct_only = parsed["direct_only"]
+
+        status_msg = await update.message.reply_text(
+            f"🔍 Searching {origin} → {destination}...\n"
+            f"{'Direct flights only | ' if direct_only else ''}Fetching calendar..."
         )
 
-    finally:
-        adb.close()
+        try:
+            dates = self.search_engine.get_available_dates(
+                origin=origin,
+                destination=destination,
+                month=month_filter or "",
+                cabin=self.CABIN_CODES.get(cabin_filter) if cabin_filter else None
+            )
 
+            available_dates = [d for d in dates if d.has_availability] if dates else []
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /status command - show system health dashboard."""
-    db_path = context.bot_data.get("db_path", "sas_monitor.db")
-
-    from sas_monitor import AvailabilityDatabase
-    adb = AvailabilityDatabase(db_path)
-
-    try:
-        stats = adb.get_stats()
-
-        # Format last scraped time
-        last_scraped = stats.get("last_scraped", "Never")
-        if last_scraped and last_scraped != "Never":
-            try:
-                from datetime import datetime
-                ls_dt = datetime.strptime(last_scraped, "%Y-%m-%d %H:%M:%S")
-                last_scraped = ls_dt.strftime("%b %d, %H:%M:%S")
-            except:
-                pass
-
-        message = "📊 <b>System Status Dashboard</b>\n\n"
-        message += f"🕐 <b>Last Scan:</b> {last_scraped}\n"
-        message += f"📁 <b>Total Records:</b> {stats.get('total_records', 0):,}\n"
-        message += f"🛤️ <b>Unique Routes:</b> {stats.get('unique_routes', 0)}\n"
-        message += f"📋 <b>Baseline Tickets:</b> {stats.get('baseline_tickets', 0):,}\n"
-        message += f"📨 <b>Notifications Sent:</b> {stats.get('notifications_sent', 0)}\n"
-        message += "\n✅ <i>Monitor is running</i>"
-
-        await update.message.reply_text(message, parse_mode=ParseMode.HTML)
-    finally:
-        adb.close()
-
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle callback queries from inline keyboard buttons."""
-    query = update.callback_query
-    await query.answer()  # Acknowledge the callback
-
-    data = query.data
-    logger.info(f"Callback received: {data}")
-
-    # Parse callback data
-    parts = data.split(":")
-    action = parts[0]
-
-    try:
-        if action == "cat" and len(parts) == 4:
-            # Catalogue pagination/sorting: cat:page:sort:filter
-            page = int(parts[1])
-            sort_by = parts[2]
-            filter_type = parts[3]
-
-            db_path = context.bot_data.get("db_path", "sas_monitor.db")
-            from sas_monitor import AvailabilityDatabase
-            adb = AvailabilityDatabase(db_path)
-
-            try:
-                tickets = adb.get_all_tracked_tickets()
-
-                # Build new page
-                message, keyboard = build_catalogue_page(tickets, page, sort_by, filter_type)
-
-                await query.edit_message_text(
-                    message,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-            finally:
-                adb.close()
-
-        elif action == "alerts" and len(parts) == 3:
-            # alerts:page:filter
-            page = int(parts[1])
-            filter_type = parts[2]
-
-            db_path = context.bot_data.get("db_path", "sas_monitor.db")
-            from sas_monitor import AvailabilityDatabase
-            adb = AvailabilityDatabase(db_path)
-
-            try:
-                # Get notifications with filter
-                notifications = adb.get_notification_history(
-                    limit=100, offset=0, filter_type=filter_type
+            # Fallback: if calendar API returns nothing, probe the offers API
+            # for upcoming dates. This catches new routes not yet in the calendar.
+            if not available_dates:
+                await status_msg.edit_text(
+                    f"🔍 {origin} → {destination} not in calendar.\n"
+                    f"Probing flights directly (new route?)..."
                 )
 
-                # Rebuild page
-                message, keyboard = build_alerts_page(notifications, page, filter_type)
+                probe_dates = []
+                now = datetime.now()
+                # Probe ~2 dates per week for the next 8 weeks
+                for week_offset in range(8):
+                    probe_day = now + timedelta(days=7 + week_offset * 7)
+                    probe_dates.append(probe_day.strftime("%Y-%m-%d"))
 
-                await query.edit_message_text(
-                    message,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-            finally:
-                adb.close()
+                for pd in probe_dates:
+                    try:
+                        offers = self.search_engine.search_flights(
+                            origin=origin, destination=destination, date=pd
+                        )
+                        if offers:
+                            # Build an AvailabilityDate from offer data
+                            eco = sum(o.available_seats for o in offers if o.cabin_class == "ECONOMY")
+                            prem = sum(o.available_seats for o in offers if o.cabin_class == "PREMIUM")
+                            biz = sum(o.available_seats for o in offers if o.cabin_class == "BUSINESS")
+                            available_dates.append(AvailabilityDate(
+                                date=pd,
+                                economy_seats=eco or (1 if any(o.cabin_class == "ECONOMY" for o in offers) else 0),
+                                premium_seats=prem or (1 if any(o.cabin_class == "PREMIUM" for o in offers) else 0),
+                                business_seats=biz or (1 if any(o.cabin_class == "BUSINESS" for o in offers) else 0),
+                            ))
+                        await asyncio.sleep(0.4)
+                    except Exception as e:
+                        logger.warning(f"Probe failed for {pd}: {e}")
+                        continue
 
-        elif action == "search" and len(parts) == 3:
-            origin, destination = parts[1], parts[2]
-            api: SASAwardAPI = context.bot_data.get("api")
-            
-            # Show loading state
-            await query.edit_message_text(
-                f"🔍 Searching {origin} → {destination}...",
-                parse_mode=ParseMode.HTML
-            )
-            
-            # Query API
-            api_data = api.get_availability(origin=origin, destination=destination)
-            result_message = format_search_results(origin, destination, api_data, compact=False)
-            
-            # Create inline keyboard for actions
-            keyboard = [
-                [
-                    InlineKeyboardButton("🔄 Refresh", callback_data=f"search:{origin}:{destination}"),
-                    InlineKeyboardButton("📅 Calendar", callback_data=f"calendar:{origin}:{destination}"),
-                    InlineKeyboardButton("📜 History", callback_data=f"history:{origin}:{destination}"),
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await query.edit_message_text(
-                result_message,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                reply_markup=reply_markup
-            )
-            
-        elif action == "calendar" and len(parts) == 3:
-            origin, destination = parts[1], parts[2]
-            api: SASAwardAPI = context.bot_data.get("api")
-            
-            await query.edit_message_text(
-                f"📅 Loading calendar for {origin} → {destination}...",
-                parse_mode=ParseMode.HTML
-            )
-            
-            # Fetch data
-            api_data = api.get_availability(origin=origin, destination=destination)
-            
-            if not api_data:
-                await query.edit_message_text(
-                    f"ℹ️ No data found for {origin} → {destination}",
-                    parse_mode=ParseMode.HTML
+            if not available_dates:
+                await status_msg.edit_text(
+                    f"❌ No availability found for {origin} → {destination}\n\n"
+                    f"Set up an alert: `/subscribe {origin} {destination}`",
+                    parse_mode="Markdown"
                 )
                 return
-            
-            dest_data = api_data[0]
-            city_name = dest_data.get("cityName", destination)
-            
-            # Build calendar grid
-            message = f"📅 <b>Calendar: {origin} → {city_name}</b>\n\n"
-            message += "<b>Legend:</b> 🟥 None | 💺 Economy | ⭐ Premium | 💎 Business\n\n"
-            
-            for direction_key, direction_label in [("outbound", "OUTBOUND"), ("inbound", "RETURN")]:
-                direction_data = dest_data.get("availability", {}).get(direction_key, [])
-                if not direction_data:
-                    continue
-                
-                message += f"<b>{direction_label}:</b>\n"
-                by_month = {}
-                for avail in sorted(direction_data, key=lambda x: x.get("date", "")):
-                    date = avail.get("date", "")
-                    if not date:
-                        continue
-                    month_key = date[:7]
-                    if month_key not in by_month:
-                        by_month[month_key] = []
-                    
-                    if avail.get("AB", 0) > 0:
-                        by_month[month_key].append("💎")
-                    elif avail.get("AP", 0) > 0:
-                        by_month[month_key].append("⭐")
-                    elif avail.get("AG", 0) > 0:
-                        by_month[month_key].append("💺")
-                    else:
-                        by_month[month_key].append("🟥")
-                
-                for month_name, emojis in by_month.items():
-                    message += f"<code>{month_name}:</code> {''.join(emojis)}\n"
-                message += "\n"
-            
-            keyboard = [
-                [
-                    InlineKeyboardButton("🔍 Search", callback_data=f"search:{origin}:{destination}"),
-                    InlineKeyboardButton("📜 History", callback_data=f"history:{origin}:{destination}"),
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await query.edit_message_text(
-                message,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup
-            )
-            
-        elif action == "history" and len(parts) == 3:
-            origin, destination = parts[1], parts[2]
-            db_path = context.bot_data.get("db_path", "sas_monitor.db")
-            
-            from sas_monitor import AvailabilityDatabase
-            adb = AvailabilityDatabase(db_path)
-            
-            try:
-                history = adb.get_release_history(origin, destination)
-                if not history:
-                    await query.edit_message_text(
-                        f"ℹ️ No release history found for {origin} → {destination}",
-                        parse_mode=ParseMode.HTML
-                    )
-                    return
-                
-                message = f"📜 <b>Release History: {origin} → {destination}</b>\n\n"
-                message += "<i>When seats were first detected:</i>\n\n"
-                
-                for date, cabin, seats, first_seen in history[:10]:  # Limit to 10
-                    class_name = SASAwardAPI.CABIN_CODES.get(cabin, cabin)
-                    emoji = CABIN_CLASSES.get(cabin, {}).get("emoji", "✈️")
-                    try:
-                        fs_dt = datetime.strptime(first_seen, "%Y-%m-%d %H:%M:%S")
-                        fs_display = fs_dt.strftime("%b %d, %H:%M")
-                    except:
-                        fs_display = first_seen
-                    message += f"📅 <b>{date}</b>\n  {emoji} {class_name}: {seats} | ⏰ {fs_display}\n\n"
-                
-                keyboard = [
-                    [
-                        InlineKeyboardButton("🔍 Search", callback_data=f"search:{origin}:{destination}"),
-                        InlineKeyboardButton("📅 Calendar", callback_data=f"calendar:{origin}:{destination}"),
-                    ]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await query.edit_message_text(
-                    message,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=reply_markup
-                )
-            finally:
-                adb.close()
-                
-        elif action == "status":
-            db_path = context.bot_data.get("db_path", "sas_monitor.db")
-            from sas_monitor import AvailabilityDatabase
-            adb = AvailabilityDatabase(db_path)
-            
-            try:
-                stats = adb.get_stats()
-                last_scraped = stats.get("last_scraped", "Never")
-                if last_scraped and last_scraped != "Never":
-                    try:
-                        ls_dt = datetime.strptime(last_scraped, "%Y-%m-%d %H:%M:%S")
-                        last_scraped = ls_dt.strftime("%b %d, %H:%M:%S")
-                    except:
-                        pass
-                
-                message = "📊 <b>System Status Dashboard</b>\n\n"
-                message += f"🕐 <b>Last Scan:</b> {last_scraped}\n"
-                message += f"📁 <b>Total Records:</b> {stats.get('total_records', 0):,}\n"
-                message += f"🛤️ <b>Unique Routes:</b> {stats.get('unique_routes', 0)}\n"
-                message += f"📋 <b>Baseline Tickets:</b> {stats.get('baseline_tickets', 0):,}\n"
-                message += f"📨 <b>Notifications Sent:</b> {stats.get('notifications_sent', 0)}\n"
-                message += "\n✅ <i>Monitor is running</i>"
-                
-                await query.edit_message_text(message, parse_mode=ParseMode.HTML)
-            finally:
-                adb.close()
-                
-        elif action == "best":
-            db_path = context.bot_data.get("db_path", "sas_monitor.db")
-            from sas_monitor import AvailabilityDatabase
-            adb = AvailabilityDatabase(db_path)
-            
-            try:
-                best_bets = adb.get_best_bets(limit=10)
-                if not best_bets:
-                    await query.edit_message_text(
-                        "ℹ️ No Business Class availability found.",
-                        parse_mode=ParseMode.HTML
-                    )
-                    return
-                
-                message = "💎 <b>Best Bets: Business Class</b>\n\n"
-                for origin, destination, date, seats in best_bets:
-                    message += f"💼 <b>{origin} → {destination}</b>\n  📅 {date}: <b>{seats}</b> seats\n\n"
-                
-                await query.edit_message_text(
-                    message,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True
-                )
-            finally:
-                adb.close()
-                
-    except Exception as e:
-        logger.error(f"Callback error: {e}")
-        await query.edit_message_text(
-            f"❌ Error: {str(e)}",
-            parse_mode=ParseMode.HTML
+
+            # Cache search data
+            self.search_cache[chat_id] = {
+                "origin": origin,
+                "destination": destination,
+                "dates": available_dates,
+                "all_dates": available_dates.copy(),  # Keep original for filtering
+                "cabin_filter": cabin_filter,
+                "direct_only": direct_only,
+                "saver_only": parsed.get("saver_only", False),
+                "sort_by": "date",
+                "current_page": 0,
+                "mode": "calendar"
+            }
+
+            await self._send_calendar_view(status_msg, chat_id)
+
+        except Exception as e:
+            logger.error(f"Search error: {e}", exc_info=True)
+            await status_msg.edit_text(f"❌ Search failed: {str(e)[:100]}")
+
+    async def _search_bonus(self, update: Update, chat_id: str, parsed: Dict):
+        """Search for bonus/saver tickets only - scans dates for actual bonus availability."""
+        origin = parsed["origin"]
+        destination = parsed["destination"]
+        cabin_filter = parsed["cabin_filter"]
+
+        status_msg = await update.message.reply_text(
+            f"🌟 Scanning for BONUS tickets {origin} → {destination}...\n"
+            f"Checking dates for 30k/45k/60k awards..."
         )
-
-
-async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle unknown commands."""
-    await update.message.reply_text(
-        "❓ Unknown command. Use /help to see available commands.",
-        parse_mode=ParseMode.HTML
-    )
-
-
-# ============================================================================
-# Bot Application
-# ============================================================================
-
-class SASAwardBot:
-    """Interactive Telegram bot for SAS award searches."""
-
-    def __init__(self, config: Config):
-        self.config = config
-        self.api = SASAwardAPI(config)
-
-        if not config.telegram_bot_token:
-            raise ValueError("Bot token not configured")
-
-        # Initialize bot application with post_init callback
-        self.application = (
-            Application.builder()
-            .token(config.telegram_bot_token)
-            .post_init(self.post_init)
-            .build()
-        )
-
-        # Store API client in bot_data for handlers to access
-        self.application.bot_data["api"] = self.api
-        self.application.bot_data["db_path"] = config.db_path
-
-        # Register command handlers
-        self.application.add_handler(CommandHandler("start", start_command))
-        self.application.add_handler(CommandHandler("help", help_command))
-        self.application.add_handler(CommandHandler("notify", notify_command))
-        self.application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
-        self.application.add_handler(CommandHandler("search", search_command))
-        self.application.add_handler(CommandHandler("history", history_command))
-        self.application.add_handler(CommandHandler("best", best_command))
-        self.application.add_handler(CommandHandler("calendar", calendar_command))
-        self.application.add_handler(CommandHandler("catalogue", catalogue_command))
-        self.application.add_handler(CommandHandler("tickets", tickets_command))
-        self.application.add_handler(CommandHandler("sales", sales_command))
-        self.application.add_handler(CommandHandler("velocity", velocity_command))
-        self.application.add_handler(CommandHandler("stats", stats_command))
-        self.application.add_handler(CommandHandler("status", status_command))
-        self.application.add_handler(CommandHandler("alerts", alerts_command))
-
-        # Register callback query handler for inline buttons
-        self.application.add_handler(CallbackQueryHandler(callback_handler))
-
-        # Handle unknown commands via MessageHandler
-        from telegram.ext import MessageHandler
-        self.application.add_handler(
-            MessageHandler(filters.COMMAND, unknown_command)
-        )
-
-        logger.info("Bot initialized successfully")
-
-    async def post_init(self, application):
-        """Set bot commands after initialization."""
-        commands = [
-            ("start", "Welcome message & quick buttons"),
-            ("notify", "Subscribe to notifications"),
-            ("unsubscribe", "Stop receiving notifications"),
-            ("search", "Search for availability (OSL BKK)"),
-            ("catalogue", "Browse all tracked tickets"),
-            ("tickets", "View tracked tickets (OSL-BKK)"),
-            ("sales", "Fastest selling tickets history"),
-            ("velocity", "Hottest tickets (booking fast)"),
-            ("calendar", "Calendar view (OSL BKK)"),
-            ("history", "Release history (OSL BKK)"),
-            ("best", "Best Business Class availability"),
-            ("stats", "Enhanced statistics dashboard"),
-            ("status", "System health dashboard"),
-            ("help", "Show all commands"),
-        ]
-        await application.bot.set_my_commands(commands)
-        logger.info("Bot commands registered with Telegram")
-
-    def run(self):
-        """Start the bot with polling."""
-        logger.info("Starting SAS EuroBonus Award Search Bot")
-        logger.info("Bot is running. Press Ctrl+C to stop.")
 
         try:
-            # Run bot with polling
-            self.application.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True  # Ignore old updates on startup
+            # First get available dates from calendar
+            dates = self.search_engine.get_available_dates(
+                origin=origin,
+                destination=destination,
+                cabin=self.CABIN_CODES.get(cabin_filter) if cabin_filter else None
             )
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by user")
+
+            available_dates = [d for d in dates if d.has_availability]
+
+            if not available_dates:
+                await status_msg.edit_text(
+                    f"❌ No availability found for {origin} → {destination}\n\n"
+                    f"Set up alert: `/subscribe {origin} {destination} bonus`",
+                    parse_mode="Markdown"
+                )
+                return
+
+            # Limit dates to check (avoid timeout)
+            dates_to_check = available_dates[:20]
+
+            await status_msg.edit_text(
+                f"🌟 Scanning {len(dates_to_check)} dates for BONUS tickets...\n"
+                f"Progress: 0/{len(dates_to_check)}"
+            )
+
+            # Collect bonus offers from each date
+            bonus_results = []  # [(date, cabin, points, seats, stops, duration)]
+
+            for i, d in enumerate(dates_to_check):
+                try:
+                    offers = self.search_engine.search_flights(
+                        origin=origin,
+                        destination=destination,
+                        date=d.date,
+                        cabin_filter=cabin_filter
+                    )
+
+                    # Filter to bonus only
+                    bonus_offers = [o for o in offers if o.is_saver_award]
+
+                    # Get best bonus offer per cabin for this date
+                    seen_cabins = set()
+                    for o in bonus_offers:
+                        if o.cabin_class not in seen_cabins:
+                            bonus_results.append({
+                                "date": d.date,
+                                "cabin": o.cabin_class,
+                                "points": o.points,
+                                "seats": o.available_seats,
+                                "stops": o.stops,
+                                "duration": o.total_duration_minutes,
+                                "product": o.product_name,
+                                "taxes": o.taxes,
+                                "currency": o.currency
+                            })
+                            seen_cabins.add(o.cabin_class)
+
+                    # Update progress every 3 dates
+                    if (i + 1) % 3 == 0:
+                        await status_msg.edit_text(
+                            f"🌟 Scanning for BONUS tickets...\n"
+                            f"Progress: {i + 1}/{len(dates_to_check)} | Found: {len(bonus_results)}"
+                        )
+
+                    await asyncio.sleep(0.3)  # Rate limiting
+                except Exception as e:
+                    logger.warning(f"Failed to check {d.date}: {e}")
+                    continue
+
+            if not bonus_results:
+                await status_msg.edit_text(
+                    f"❌ No BONUS tickets available for {origin} → {destination}\n\n"
+                    f"Only standard (expensive) tickets found.\n"
+                    f"Set up alert: `/subscribe {origin} {destination} bonus`",
+                    parse_mode="Markdown"
+                )
+                return
+
+            # Cache results
+            self.search_cache[chat_id] = {
+                "origin": origin,
+                "destination": destination,
+                "bonus_results": bonus_results,
+                "cabin_filter": cabin_filter,
+                "mode": "bonus"
+            }
+
+            await self._send_bonus_view(status_msg, chat_id)
+
         except Exception as e:
-            logger.error(f"Bot error: {e}")
-            raise
+            logger.error(f"Bonus search error: {e}", exc_info=True)
+            await status_msg.edit_text(f"❌ Search failed: {str(e)[:100]}")
 
+    async def _send_bonus_view(self, message, chat_id: str, edit: bool = True):
+        """Send bonus tickets results."""
+        cache = self.search_cache.get(chat_id)
+        if not cache or cache.get("mode") != "bonus":
+            if edit:
+                await message.edit_text("❌ Search expired. Please search again.")
+            return
 
-# ============================================================================
-# CLI
-# ============================================================================
+        origin = cache["origin"]
+        destination = cache["destination"]
+        results = cache["bonus_results"]
+        cabin_filter = cache.get("cabin_filter")
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="SAS EuroBonus Interactive Telegram Bot",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Example:
-  python telegram_bot.py
-  python telegram_bot.py --config config.json
+        # Group by cabin
+        by_cabin = {"ECONOMY": [], "PREMIUM": [], "BUSINESS": []}
+        for r in results:
+            if r["cabin"] in by_cabin:
+                by_cabin[r["cabin"]].append(r)
 
-Users can then interact with the bot:
-  /start - Welcome message
-  /help - Show help
-  /search OSL BKK - Search for award availability
-"""
-    )
+        # Sort each cabin by date
+        for cabin in by_cabin:
+            by_cabin[cabin].sort(key=lambda x: x["date"])
 
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="config.json",
-        help="Path to JSON config file (default: config.json)"
-    )
+        header = f"🌟 **BONUS Tickets: {origin} → {destination}**\n"
+        if cabin_filter:
+            header += f"Cabin: {cabin_filter}\n"
 
-    args = parser.parse_args()
+        # Count unique dates with bonus
+        unique_dates = len(set(r["date"] for r in results))
+        header += f"📊 Found {len(results)} bonus options across {unique_dates} dates\n\n"
 
-    # Load configuration
-    config_path = Path(args.config)
-    if not config_path.exists():
-        logger.error(f"Config file not found: {config_path}")
-        logger.info("Please create config.json with bot token and other settings")
-        sys.exit(1)
+        lines = []
+        cabin_emoji = {"ECONOMY": "💺", "PREMIUM": "💎", "BUSINESS": "👔"}
+        cabin_points = {"ECONOMY": "30k", "PREMIUM": "45k", "BUSINESS": "60k"}
 
-    try:
-        config = Config.from_file(str(config_path))
-    except Exception as e:
-        logger.error(f"Failed to load config: {e}")
-        sys.exit(1)
+        for cabin in ["ECONOMY", "PREMIUM", "BUSINESS"]:
+            cabin_results = by_cabin[cabin]
+            if not cabin_results:
+                continue
 
-    if not config.telegram_bot_token:
-        logger.error("telegram_bot_token not set in config")
-        sys.exit(1)
+            lines.append(f"**{cabin_emoji[cabin]} {cabin} BONUS** ({cabin_points[cabin]} pts)")
 
-    # Initialize and run bot
-    try:
-        bot = SASAwardBot(config)
-        bot.run()
-    except Exception as e:
-        logger.error(f"Failed to start bot: {e}")
-        sys.exit(1)
+            for r in cabin_results[:6]:  # Show up to 6 dates per cabin
+                date_obj = datetime.strptime(r["date"], "%Y-%m-%d")
+                date_str = date_obj.strftime("%a %d %b")
+                stops_str = "Direct" if r["stops"] == 0 else f"{r['stops']}stop"
+                hours = r["duration"] // 60
+
+                lines.append(
+                    f"  `{date_str}` | {r['seats']} seats | {stops_str} | {hours}h"
+                )
+
+            if len(cabin_results) > 6:
+                lines.append(f"  _+{len(cabin_results) - 6} more dates..._")
+            lines.append("")
+
+        body = "\n".join(lines)
+
+        # Keyboard
+        keyboard = []
+
+        # Date buttons for quick access (first 10 unique dates)
+        unique_dates_list = sorted(set(r["date"] for r in results))[:10]
+        date_buttons = []
+        for d in unique_dates_list:
+            date_obj = datetime.strptime(d, "%Y-%m-%d")
+            btn_text = date_obj.strftime("%d %b")
+            date_buttons.append(InlineKeyboardButton(btn_text, callback_data=f"bonusdate:{d}"))
+
+        for i in range(0, len(date_buttons), 5):
+            keyboard.append(date_buttons[i:i+5])
+
+        # Action buttons
+        keyboard.append([
+            InlineKeyboardButton("🔔 Alert (Bonus)", callback_data="alert_bonus"),
+            InlineKeyboardButton("🔄 Refresh", callback_data="refresh_bonus")
+        ])
+        keyboard.append([
+            InlineKeyboardButton("📅 All Dates (Calendar)", callback_data="to_calendar_from_bonus")
+        ])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        text = header + body
+
+        if edit:
+            await message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        else:
+            await message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+    async def _search_cheapest(self, update: Update, chat_id: str, parsed: Dict):
+        """Find cheapest flights across all dates."""
+        origin = parsed["origin"]
+        destination = parsed["destination"]
+        cabin_filter = parsed["cabin_filter"]
+
+        status_msg = await update.message.reply_text(
+            f"🔍 Finding cheapest {origin} → {destination}...\n"
+            f"Scanning all available dates (this may take a moment)..."
+        )
+
+        try:
+            # First get available dates
+            dates = self.search_engine.get_available_dates(
+                origin=origin,
+                destination=destination,
+                cabin=self.CABIN_CODES.get(cabin_filter) if cabin_filter else None
+            )
+
+            available_dates = [d for d in dates if d.has_availability]
+
+            if not available_dates:
+                await status_msg.edit_text(f"❌ No availability found for {origin} → {destination}")
+                return
+
+            # Limit to first 30 dates to avoid timeout
+            dates_to_check = available_dates[:30]
+
+            await status_msg.edit_text(
+                f"🔍 Checking {len(dates_to_check)} dates for best prices...\n"
+                f"Progress: 0/{len(dates_to_check)}"
+            )
+
+            # Collect cheapest offers from each date
+            all_offers: List[Tuple[str, FlightOffer]] = []
+
+            for i, d in enumerate(dates_to_check):
+                try:
+                    offers = self.search_engine.search_flights(
+                        origin=origin,
+                        destination=destination,
+                        date=d.date,
+                        cabin_filter=cabin_filter
+                    )
+                    for offer in offers:
+                        all_offers.append((d.date, offer))
+
+                    # Update progress every 5 dates
+                    if (i + 1) % 5 == 0:
+                        await status_msg.edit_text(
+                            f"🔍 Checking dates for best prices...\n"
+                            f"Progress: {i + 1}/{len(dates_to_check)}"
+                        )
+
+                    await asyncio.sleep(0.3)  # Rate limiting
+                except Exception as e:
+                    logger.warning(f"Failed to check {d.date}: {e}")
+                    continue
+
+            if not all_offers:
+                await status_msg.edit_text(f"❌ Could not fetch pricing data")
+                return
+
+            # Sort by points and get top results
+            all_offers.sort(key=lambda x: x[1].points)
+
+            # Cache results
+            self.search_cache[chat_id] = {
+                "origin": origin,
+                "destination": destination,
+                "cheapest_offers": all_offers[:20],  # Top 20
+                "cabin_filter": cabin_filter,
+                "mode": "cheapest"
+            }
+
+            await self._send_cheapest_view(status_msg, chat_id)
+
+        except Exception as e:
+            logger.error(f"Cheapest search error: {e}", exc_info=True)
+            await status_msg.edit_text(f"❌ Search failed: {str(e)[:100]}")
+
+    async def _search_multi_destination(self, update: Update, chat_id: str, parsed: Dict):
+        """Search all destinations from origin or all origins to destination."""
+        origin = parsed["origin"]
+        destination = parsed["destination"]
+        points_budget = parsed["points_budget"]
+        cabin_filter = parsed["cabin_filter"]
+
+        if origin:
+            # OSL-* search: forward query
+            search_type = "from"
+            fixed_airport = origin
+            status_msg = await update.message.reply_text(
+                f"🔍 Finding all destinations from {origin}...\n"
+                f"{'Budget: ' + str(points_budget) + ' pts | ' if points_budget else ''}"
+                f"Scanning network..."
+            )
+        else:
+            # *-BKK search: reverse query - need to scan hubs
+            search_type = "to"
+            fixed_airport = destination
+            status_msg = await update.message.reply_text(
+                f"🔍 Finding routes to {destination}...\n"
+                f"Scanning {len(REVERSE_SEARCH_HUBS)} hubs..."
+            )
+
+        try:
+            destinations_data = []
+
+            if search_type == "from":
+                # Forward search: use calendar API directly
+                raw_data = self.search_engine.get_availability_calendar(
+                    origin=origin,
+                    destination="",
+                )
+
+                for dest in raw_data:
+                    dest_code = dest.get("airportCode") or dest.get("iataCode", "")
+                    if not dest_code:
+                        continue
+
+                    availability = dest.get("availability", {})
+                    outbound = availability.get("outbound", [])
+
+                    total_dates = 0
+                    total_eco = 0
+                    total_prem = 0
+                    total_biz = 0
+
+                    for day in outbound:
+                        eco = int(day.get("AG", 0) or 0)
+                        prem = int(day.get("AP", 0) or 0)
+                        biz = int(day.get("AB", 0) or 0)
+
+                        if eco + prem + biz > 0:
+                            total_dates += 1
+                            total_eco += eco
+                            total_prem += prem
+                            total_biz += biz
+
+                    if total_dates > 0:
+                        destinations_data.append({
+                            "code": dest_code,
+                            "region": get_region(dest_code),
+                            "dates": total_dates,
+                            "economy": total_eco,
+                            "premium": total_prem,
+                            "business": total_biz,
+                        })
+            else:
+                # Reverse search: scan hubs to find origins that fly TO destination
+                for i, hub in enumerate(REVERSE_SEARCH_HUBS):
+                    # Skip if hub is the destination itself
+                    if hub == destination:
+                        continue
+
+                    try:
+                        dates = self.search_engine.get_available_dates(hub, destination)
+                        avail_dates = [d for d in dates if d.has_availability]
+
+                        if avail_dates:
+                            total_eco = sum(d.economy_seats for d in avail_dates)
+                            total_prem = sum(d.premium_seats for d in avail_dates)
+                            total_biz = sum(d.business_seats for d in avail_dates)
+
+                            destinations_data.append({
+                                "code": hub,
+                                "region": get_region(hub),
+                                "dates": len(avail_dates),
+                                "economy": total_eco,
+                                "premium": total_prem,
+                                "business": total_biz,
+                            })
+
+                        # Update progress every 3 hubs
+                        if (i + 1) % 3 == 0:
+                            await status_msg.edit_text(
+                                f"🔍 Scanning hubs to {destination}... {i + 1}/{len(REVERSE_SEARCH_HUBS)}"
+                            )
+
+                        await asyncio.sleep(0.2)  # Rate limit
+                    except Exception as e:
+                        logger.warning(f"Failed to check hub {hub}: {e}")
+                        continue
+
+            if not destinations_data:
+                if search_type == "from":
+                    await status_msg.edit_text(f"❌ No destinations found from {fixed_airport}")
+                else:
+                    await status_msg.edit_text(f"❌ No routes found to {fixed_airport}")
+                return
+
+            # Sort by number of available dates
+            destinations_data.sort(key=lambda x: -x["dates"])
+
+            # Cache results
+            self.search_cache[chat_id] = {
+                "origin": origin,
+                "destination": destination,
+                "fixed_airport": fixed_airport,
+                "search_type": search_type,
+                "destinations": destinations_data,
+                "points_budget": points_budget,
+                "cabin_filter": cabin_filter,
+                "current_page": 0,
+                "group_by_region": True,
+                "mode": "multi_dest"
+            }
+
+            await self._send_multi_dest_view(status_msg, chat_id)
+
+        except Exception as e:
+            logger.error(f"Multi-dest search error: {e}", exc_info=True)
+            await status_msg.edit_text(f"❌ Search failed: {str(e)[:100]}")
+
+    async def _send_calendar_view(self, message, chat_id: str, page: int = 0, edit: bool = True):
+        """Send or edit the calendar view message."""
+        cache = self.search_cache.get(chat_id)
+        if not cache:
+            if edit:
+                await message.edit_text("❌ Search expired. Please search again.")
+            return
+
+        origin = cache["origin"]
+        destination = cache["destination"]
+        dates = cache["dates"]
+        # Sort by date by default for calendar view
+        dates = sorted(dates, key=lambda d: d.date)
+
+        # Pagination
+        PAGE_SIZE = 10
+        total_pages = max(1, (len(dates) + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = max(0, min(page, total_pages - 1))
+        cache["current_page"] = page
+
+        start_idx = page * PAGE_SIZE
+        end_idx = min(start_idx + PAGE_SIZE, len(dates))
+        page_dates = dates[start_idx:end_idx]
+
+        # Compute summary stats across ALL dates
+        total_eco = sum(d.economy_seats for d in dates)
+        total_prem = sum(d.premium_seats for d in dates)
+        total_biz = sum(d.business_seats for d in dates)
+        dates_with_biz = sum(1 for d in dates if d.business_seats > 0)
+        dates_with_prem = sum(1 for d in dates if d.premium_seats > 0)
+
+        best_date = max(dates, key=lambda d: d.economy_seats + d.premium_seats + d.business_seats) if dates else None
+        best_total = (best_date.economy_seats + best_date.premium_seats + best_date.business_seats) if best_date else 0
+
+        # Header
+        header = f"✈️ **{origin} → {destination}**\n"
+
+        # Summary line
+        cabin_summary_parts = []
+        if total_eco:
+            cabin_summary_parts.append(f"💺{total_eco}")
+        if total_prem:
+            cabin_summary_parts.append(f"💎{total_prem}")
+        if total_biz:
+            cabin_summary_parts.append(f"👔{total_biz}")
+        header += f"{len(dates)} dates · {' · '.join(cabin_summary_parts)} total seats\n"
+
+        # Best date highlight
+        if best_date:
+            best_obj = datetime.strptime(best_date.date, "%Y-%m-%d")
+            best_parts = []
+            if best_date.economy_seats:
+                best_parts.append(f"💺{best_date.economy_seats}")
+            if best_date.premium_seats:
+                best_parts.append(f"💎{best_date.premium_seats}")
+            if best_date.business_seats:
+                best_parts.append(f"👔{best_date.business_seats}")
+            header += f"⭐ Best: **{best_obj.strftime('%a %d %b')}** — {' '.join(best_parts)}\n"
+
+        # Premium cabin callouts
+        cabin_callouts = []
+        if dates_with_biz:
+            cabin_callouts.append(f"👔 Biz on {dates_with_biz} date{'s' if dates_with_biz != 1 else ''}")
+        if dates_with_prem:
+            cabin_callouts.append(f"💎 Plus on {dates_with_prem} date{'s' if dates_with_prem != 1 else ''}")
+        if cabin_callouts:
+            header += " · ".join(cabin_callouts) + "\n"
+
+        if total_pages > 1:
+            header += f"_Page {page + 1}/{total_pages}_\n"
+
+        header += "\n"
+
+        # Body - date rows grouped by month
+        lines = []
+        current_month = None
+
+        for d in page_dates:
+            date_obj = datetime.strptime(d.date, "%Y-%m-%d")
+
+            # Month group header
+            month_name = date_obj.strftime("%b %Y")
+            if month_name != current_month:
+                if current_month is not None:
+                    lines.append("")  # spacing between months
+                lines.append(f"**{month_name}**")
+                current_month = month_name
+
+            # Availability indicator
+            total = d.economy_seats + d.premium_seats + d.business_seats
+            if total >= 10:
+                dot = "🟢"
+            elif total >= 4:
+                dot = "🟡"
+            else:
+                dot = "🔴"
+
+            # Cabin breakdown
+            cabins = []
+            if d.economy_seats > 0:
+                cabins.append(f"💺{d.economy_seats}")
+            if d.premium_seats > 0:
+                cabins.append(f"💎{d.premium_seats}")
+            if d.business_seats > 0:
+                cabins.append(f"👔{d.business_seats}")
+
+            cabin_str = "  ".join(cabins)
+
+            # Star marker for best date
+            star = " ⭐" if best_date and d.date == best_date.date and len(dates) > 1 else ""
+
+            day_str = date_obj.strftime("%a %d")
+            lines.append(f"  `{day_str}` {dot} {cabin_str}{star}")
+
+        body = "\n".join(lines)
+
+        # Compact legend
+        footer = "\n\n💺 Go · 💎 Plus · 👔 Biz"
+        footer += "\n🟢 10+ · 🟡 4-9 · 🔴 1-3 seats"
+
+        # Keyboard construction
+        keyboard = []
+
+        # Date Buttons (Row of 5)
+        row = []
+        for d in page_dates:
+            d_obj = datetime.strptime(d.date, "%Y-%m-%d")
+            row.append(InlineKeyboardButton(d_obj.strftime("%d"), callback_data=f"date:{d.date}"))
+            if len(row) == 5:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+
+        # Navigation
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"page:{page-1}"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"page:{page+1}"))
+        if nav:
+            keyboard.append(nav)
+
+        # Actions
+        keyboard.append([
+            InlineKeyboardButton("🔎 Load Details (Prices & Times)", callback_data="load_details"),
+            InlineKeyboardButton("🔔 Alert", callback_data="alert")
+        ])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        final_text = header + body + footer
+
+        if edit:
+            await message.edit_text(final_text, reply_markup=reply_markup, parse_mode="Markdown")
+        else:
+            await message.reply_text(final_text, reply_markup=reply_markup, parse_mode="Markdown")
+
+    async def _send_cheapest_view(self, message, chat_id: str, edit: bool = True):
+        """Send cheapest flights results."""
+        cache = self.search_cache.get(chat_id)
+        if not cache or cache.get("mode") != "cheapest":
+            if edit:
+                await message.edit_text("❌ Search expired. Please search again.")
+            return
+
+        origin = cache["origin"]
+        destination = cache["destination"]
+        offers = cache["cheapest_offers"]
+        cabin_filter = cache.get("cabin_filter")
+
+        header = f"💰 **Cheapest: {origin} → {destination}**\n"
+        if cabin_filter:
+            header += f"Cabin: {cabin_filter}\n"
+        header += f"Top {len(offers)} options:\n\n"
+
+        lines = []
+        by_cabin: Dict[str, List] = {"ECONOMY": [], "PREMIUM": [], "BUSINESS": []}
+
+        for date, offer in offers:
+            if offer.cabin_class in by_cabin:
+                by_cabin[offer.cabin_class].append((date, offer))
+
+        cabin_emoji = {"ECONOMY": "💺", "PREMIUM": "💎", "BUSINESS": "👔"}
+
+        for cabin in ["ECONOMY", "PREMIUM", "BUSINESS"]:
+            cabin_offers = by_cabin[cabin][:5]  # Top 5 per cabin
+            if not cabin_offers:
+                continue
+
+            lines.append(f"**{cabin_emoji[cabin]} {cabin}**")
+            for date, o in cabin_offers:
+                date_obj = datetime.strptime(date, "%Y-%m-%d")
+                date_str = date_obj.strftime("%d %b")
+                stops_str = "Direct" if o.is_direct else f"{o.stops}stop"
+                lines.append(f"  `{o.points:,}` pts | {date_str} | {stops_str}")
+            lines.append("")
+
+        body = "\n".join(lines)
+
+        # Keyboard
+        keyboard = [
+            [InlineKeyboardButton("🔔 Set Alert", callback_data="alert")],
+            [InlineKeyboardButton("📅 Calendar View", callback_data="to_calendar")],
+        ]
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        text = header + body
+
+        if edit:
+            await message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        else:
+            await message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+    async def _send_multi_dest_view(self, message, chat_id: str, page: int = 0, edit: bool = True):
+        """Send multi-destination search results."""
+        cache = self.search_cache.get(chat_id)
+        if not cache or cache.get("mode") != "multi_dest":
+            if edit:
+                await message.edit_text("❌ Search expired. Please search again.")
+            return
+
+        fixed_airport = cache["fixed_airport"]
+        search_type = cache["search_type"]
+        destinations = cache["destinations"]
+        points_budget = cache.get("points_budget")
+        group_by_region = cache.get("group_by_region", True)
+
+        label = "destinations" if search_type == "from" else "origins"
+
+        if search_type == "from":
+            header = f"🌍 **{fixed_airport} → All Destinations**\n"
+        else:
+            header = f"🌍 **All Origins → {fixed_airport}**\n"
+
+        # Summary stats
+        total_dates = sum(d["dates"] for d in destinations)
+        total_eco = sum(d["economy"] for d in destinations)
+        total_prem = sum(d["premium"] for d in destinations)
+        total_biz = sum(d["business"] for d in destinations)
+        origins_with_biz = sum(1 for d in destinations if d["business"] > 0)
+        origins_with_prem = sum(1 for d in destinations if d["premium"] > 0)
+
+        header += f"{len(destinations)} {label} · {total_dates} dates\n"
+
+        seat_parts = []
+        if total_eco:
+            seat_parts.append(f"💺{total_eco}")
+        if total_prem:
+            seat_parts.append(f"💎{total_prem}")
+        if total_biz:
+            seat_parts.append(f"👔{total_biz}")
+        if seat_parts:
+            header += " · ".join(seat_parts) + " total seats\n"
+
+        cabin_callouts = []
+        if origins_with_biz:
+            cabin_callouts.append(f"👔 Biz from {origins_with_biz} {label}")
+        if origins_with_prem:
+            cabin_callouts.append(f"💎 Plus from {origins_with_prem} {label}")
+        if cabin_callouts:
+            header += " · ".join(cabin_callouts) + "\n"
+
+        if points_budget:
+            header += f"💰 Budget: {points_budget:,} pts\n"
+
+        header += "\n"
+
+        lines = []
+
+        if group_by_region:
+            # Group by region
+            by_region: Dict[str, List] = {}
+            for dest in destinations:
+                region = dest["region"]
+                if region not in by_region:
+                    by_region[region] = []
+                by_region[region].append(dest)
+
+            # Sort regions by total destinations
+            sorted_regions = sorted(by_region.items(), key=lambda x: -len(x[1]))
+
+            for region, dests in sorted_regions:  # Show ALL regions
+                lines.append(f"**{region}**")
+                for d in dests:  # Show ALL destinations
+                    cabins = []
+                    if d["economy"] > 0:
+                        cabins.append(f"💺{d['economy']}")
+                    if d["premium"] > 0:
+                        cabins.append(f"💎{d['premium']}")
+                    if d["business"] > 0:
+                        cabins.append(f"👔{d['business']}")
+                    cabin_str = "  ".join(cabins)
+                    lines.append(f"  `{d['code']}` {d['dates']}d {cabin_str}")
+                lines.append("")
+        else:
+            # Flat list sorted by seats
+            PAGE_SIZE = 20
+            total_pages = max(1, (len(destinations) + PAGE_SIZE - 1) // PAGE_SIZE)
+            page = max(0, min(page, total_pages - 1))
+            cache["current_page"] = page
+
+            start_idx = page * PAGE_SIZE
+            end_idx = min(start_idx + PAGE_SIZE, len(destinations))
+            page_dests = destinations[start_idx:end_idx]
+
+            header += f"_Page {page + 1}/{total_pages}_\n\n"
+
+            for d in page_dests:
+                cabins = []
+                if d["economy"] > 0:
+                    cabins.append(f"💺{d['economy']}")
+                if d["premium"] > 0:
+                    cabins.append(f"💎{d['premium']}")
+                if d["business"] > 0:
+                    cabins.append(f"👔{d['business']}")
+                cabin_str = "  ".join(cabins)
+                lines.append(f"`{d['code']}` ({d['region'][:4]}) {d['dates']}d {cabin_str}")
+
+        body = "\n".join(lines)
+
+        # Footer
+        footer = "\n💺 Go · 💎 Plus · 👔 Biz · _d = dates with seats_"
+
+        # Keyboard
+        keyboard = []
+
+        # Destination buttons (top destinations, increased to 15)
+        dest_buttons = []
+        for d in destinations[:15]:
+            # Filter out self-loops (don't show BKK when searching *-BKK)
+            if search_type == "to" and d["code"] == cache["destination"]:
+                continue
+            if search_type == "from" and d["code"] == cache["origin"]:
+                continue
+
+            # Use explicit direction encoding: dest:f:origin:destination or dest:t:origin:destination
+            if search_type == "from":
+                # OSL-* search: origin is fixed, d['code'] is destination
+                callback = f"dest:f:{cache['origin']}:{d['code']}"
+            else:
+                # *-BKK search: d['code'] is origin, destination is fixed
+                callback = f"dest:t:{d['code']}:{cache['destination']}"
+            dest_buttons.append(InlineKeyboardButton(d["code"], callback_data=callback))
+
+        for i in range(0, len(dest_buttons), 5):
+            keyboard.append(dest_buttons[i:i+5])
+
+        # View toggle and navigation
+        view_row = []
+        if group_by_region:
+            view_row.append(InlineKeyboardButton("📋 List View", callback_data="view:list"))
+        else:
+            view_row.append(InlineKeyboardButton("🌍 Region View", callback_data="view:region"))
+            if page > 0:
+                view_row.append(InlineKeyboardButton("⬅️", callback_data=f"mdpage:{page-1}"))
+            if page < (len(destinations) // 20):
+                view_row.append(InlineKeyboardButton("➡️", callback_data=f"mdpage:{page+1}"))
+        keyboard.append(view_row)
+
+        # Refresh
+        keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_multi")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        text = header + body + footer
+
+        if edit:
+            await message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        else:
+            await message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+    async def _send_date_details(self, message, chat_id: str, date: str):
+        """Send detailed flight information for a specific date."""
+        cache = self.search_cache.get(chat_id)
+        if not cache:
+            await message.edit_text("❌ Search expired. Please search again.")
+            return
+
+        origin = cache["origin"]
+        destination = cache["destination"]
+        cabin_filter = cache.get("cabin_filter")
+        direct_only = cache.get("direct_only", False)
+        saver_only = cache.get("saver_only", False)
+
+        await message.edit_text(f"🔍 Loading flights for {date}...\n{origin} → {destination}")
+
+        try:
+            logger.info(f"DATE DETAILS: Searching {origin} → {destination} on {date}")
+            offers = self.search_engine.search_flights(
+                origin=origin,
+                destination=destination,
+                date=date,
+                cabin_filter=cabin_filter
+            )
+
+            logger.info(f"DATE DETAILS: Got {len(offers)} offers")
+            for o in offers[:3]:  # Log first 3
+                logger.info(f"  Offer: {o.cabin_class} {o.points}pts is_saver={o.is_saver_award} product={o.product_name}")
+
+            # Filter to saver/bonus tickets only if requested
+            if saver_only and offers:
+                offers = [o for o in offers if o.is_saver_award]
+
+            # Filter direct if needed
+            if direct_only and offers:
+                offers = [o for o in offers if o.is_direct]
+
+            if not offers:
+                routes = self.search_engine.get_route_details(origin, destination, date)
+                if direct_only and routes:
+                    routes = [r for r in routes if r.num_flights == 1]
+
+                if routes:
+                    text = self._format_routes_fallback(origin, destination, date, routes)
+                else:
+                    text = f"❌ No {'direct ' if direct_only else ''}flights available for {date}"
+
+                keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="back")]]
+                await message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+                return
+
+            text = self._format_flight_offers(origin, destination, date, offers)
+
+            keyboard = [
+                [InlineKeyboardButton("⬅️ Back to Calendar", callback_data="back")],
+                [
+                    InlineKeyboardButton("🔔 Alert", callback_data=f"alert_date:{date}"),
+                    InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_date:{date}")
+                ]
+            ]
+
+            await message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+        except Exception as e:
+            logger.error(f"Date details error: {e}", exc_info=True)
+            keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="back")]]
+            await message.edit_text(f"❌ Failed to load details: {str(e)[:100]}", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    def _format_flight_offers(self, origin: str, destination: str, date: str, offers: List[FlightOffer]) -> str:
+        """Format flight offers into a readable message."""
+        date_obj = datetime.strptime(date, "%Y-%m-%d")
+        header = f"✈️ **{origin} → {destination}**\n"
+        header += f"📅 {date_obj.strftime('%A, %d %B %Y')}\n\n"
+
+        by_cabin: Dict[str, List[FlightOffer]] = {}
+        for o in offers:
+            if o.cabin_class not in by_cabin:
+                by_cabin[o.cabin_class] = []
+            by_cabin[o.cabin_class].append(o)
+
+        lines = []
+        cabin_order = ["ECONOMY", "PREMIUM", "BUSINESS"]
+
+        for cabin in cabin_order:
+            if cabin not in by_cabin:
+                continue
+
+            cabin_offers = by_cabin[cabin]
+            cabin_offers.sort(key=lambda x: x.points)
+
+            emoji = {"ECONOMY": "💺", "PREMIUM": "💎", "BUSINESS": "👔"}.get(cabin, "✈️")
+            lines.append(f"**{emoji} {cabin}**")
+
+            for o in cabin_offers[:3]:
+                hours = o.total_duration_minutes // 60
+                mins = o.total_duration_minutes % 60
+                duration_str = f"{hours}h{mins}m" if mins else f"{hours}h"
+                stops_str = "Direct" if o.is_direct else f"{o.stops} stop{'s' if o.stops > 1 else ''}"
+                bonus_marker = "🌟" if o.is_saver_award else "📌"
+                route = " → ".join([s.departure_airport for s in o.segments] + [destination])
+
+                lines.append(
+                    f"  {bonus_marker}`{o.points:,}` pts + {o.taxes:.0f} {o.currency}\n"
+                    f"  {stops_str} | {duration_str} | {o.available_seats} seats\n"
+                    f"  {route}"
+                )
+            lines.append("")
+
+        return header + "\n".join(lines)
+
+    def _format_routes_fallback(self, origin: str, destination: str, date: str, routes) -> str:
+        """Format route info as fallback when offers API unavailable."""
+        date_obj = datetime.strptime(date, "%Y-%m-%d")
+        header = f"✈️ **{origin} → {destination}**\n"
+        header += f"📅 {date_obj.strftime('%A, %d %B %Y')}\n"
+        header += f"_(Points pricing unavailable)_\n\n"
+
+        lines = []
+        for r in routes[:5]:
+            hours = r.total_time // 60
+            mins = r.total_time % 60
+            duration_str = f"{hours}h{mins}m" if mins else f"{hours}h"
+            stops_str = "Direct" if r.num_flights == 1 else f"{r.num_flights - 1} stop(s)"
+            eco = r.availability.get("AG", 0)
+            prem = r.availability.get("AP", 0)
+            biz = r.availability.get("AB", 0)
+            seats_str = f"Eco:{eco} | Prem:{prem} | Biz:{biz}"
+
+            lines.append(
+                f"🕐 {r.departure_time} → {r.arrival_time}\n"
+                f"   {stops_str} | {duration_str}\n"
+                f"   {seats_str}\n"
+            )
+
+        return header + "\n".join(lines)
+
+    async def _send_detailed_view(self, message, chat_id: str, edit: bool = True):
+        """Fetch and display detailed pricing/times for the current calendar page."""
+        cache = self.search_cache.get(chat_id)
+        if not cache:
+            if edit:
+                await message.edit_text("❌ Search expired. Please search again.")
+            return
+
+        origin = cache["origin"]
+        destination = cache["destination"]
+        dates = cache["dates"]
+        page = cache.get("current_page", 0)
+        PAGE_SIZE = 10
+        start_idx = page * PAGE_SIZE
+        end_idx = min(start_idx + PAGE_SIZE, len(dates))
+        page_dates = dates[start_idx:end_idx]
+
+        if not page_dates:
+            return
+
+        # Status update
+        await message.edit_text(
+            f"🔎 Loading details for {len(page_dates)} dates...\n"
+            f"Fetching exact prices and times. Please wait."
+        )
+
+        detailed_results = []
+        
+        # Fetch details for each date
+        # We limit concurrency or just do sequential to avoid hitting rate limits too hard
+        # For better UX, we could use a pool, but let's keep it simple and robust for now.
+        for i, d in enumerate(page_dates):
+            if i % 3 == 0: # Update status every 3 requests
+                await message.edit_text(
+                    f"🔎 Loading details... ({i}/{len(page_dates)})\n"
+                    f"Fetching exact prices and times..."
+                )
+            
+            try:
+                offers = self.search_engine.search_flights(
+                    origin=origin,
+                    destination=destination,
+                    date=d.date,
+                    cabin_filter=cache.get("cabin_filter")
+                )
+                
+                # CHEAPEST PRICE LOGIC
+                # Find lowest points for each cabin present
+                lowest_fares = {}
+                for o in offers:
+                    if o.points > 0:
+                        if o.cabin_class not in lowest_fares or o.points < lowest_fares[o.cabin_class].points:
+                            lowest_fares[o.cabin_class] = o
+                
+                detailed_results.append({
+                    "date": d.date,
+                    "offers": list(lowest_fares.values()),
+                    "count": len(offers)
+                })
+                
+                await asyncio.sleep(0.5) # Politeness delay
+            except Exception as e:
+                logger.error(f"Failed to fetch details for {d.date}: {e}")
+                detailed_results.append({"date": d.date, "error": True})
+
+        # Build Detailed Message
+        header = f"✈️ **{origin} → {destination}** (Detailed)\n"
+        header += f"📅 Dates {start_idx+1}-{end_idx}\n\n"
+        
+        lines = []
+        for res in detailed_results:
+            d_str = datetime.strptime(res["date"], "%Y-%m-%d").strftime("%a %d %b")
+            
+            if res.get("error"):
+                lines.append(f"⚠️ `{d_str}` - Failed to load")
+                continue
+                
+            offers = res["offers"]
+            if not offers:
+                lines.append(f"❌ `{d_str}` - No bookable flights found")
+                continue
+                
+            # Sort offers by cabin rank (Eco -> Biz)
+            cabin_rank = {"ECONOMY": 1, "PREMIUM": 2, "BUSINESS": 3}
+            offers.sort(key=lambda x: cabin_rank.get(x.cabin_class, 0))
+            
+            lines.append(f"🗓 **{d_str}**")
+            for o in offers:
+                emoji = {"ECONOMY": "💺", "PREMIUM": "💎", "BUSINESS": "👔"}.get(o.cabin_class, "✈️")
+                
+                # Times: 12:00-18:00
+                dep = o.segments[0].departure_time[:5]
+                arr = o.segments[-1].arrival_time[:5]
+                stops = "Direct" if o.is_direct else f"{o.stops} stop"
+                
+                # Price formatting
+                pts_str = f"{o.points/1000:.1f}k"
+                if pts_str.endswith(".0k"): pts_str = pts_str[:-3] + "k"
+                
+                lines.append(f"  {emoji} {dep}-{arr} | {pts_str} | {stops}")
+            lines.append("")
+
+        body = "\n".join(lines)
+        
+        # Footer
+        footer = "Prices are per person + taxes."
+
+        # Navigation to go back
+        keyboard = [[InlineKeyboardButton("⬅️ Back to Calendar", callback_data="back")]]
+        
+        await message.edit_text(header + body + footer, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle inline keyboard button callbacks."""
+        query = update.callback_query
+        try:
+            await query.answer()
+        except Exception:
+            pass # Ignore if answer fails (e.g. timeout)
+
+        chat_id = str(update.effective_chat.id)
+        data = query.data
+        cache = self.search_cache.get(chat_id)
+
+        # Load Details Action
+        if data == "load_details":
+            await self._send_detailed_view(query.message, chat_id)
+            return
+
+        # Date selection
+        if data.startswith("date:"):
+            date = data.split(":", 1)[1]
+            await self._send_date_details(query.message, chat_id, date)
+
+        # Page navigation
+        elif data.startswith("page:"):
+            page = int(data.split(":", 1)[1])
+            await self._send_calendar_view(query.message, chat_id, page=page)
+
+        # Multi-dest page navigation
+        elif data.startswith("mdpage:"):
+            page = int(data.split(":", 1)[1])
+            await self._send_multi_dest_view(query.message, chat_id, page=page)
+
+        # Sort change
+        elif data.startswith("sort:"):
+            sort_key = data.split(":", 1)[1]
+            if cache:
+                cache["sort_by"] = sort_key
+                cache["current_page"] = 0
+                await self._send_calendar_view(query.message, chat_id)
+
+        # Cabin filter
+        elif data.startswith("cabin:"):
+            cabin = data.split(":", 1)[1]
+            if cache:
+                if cache.get("cabin_filter") == cabin:
+                    cache["cabin_filter"] = None
+                else:
+                    cache["cabin_filter"] = cabin
+
+                await query.message.edit_text(f"🔍 Filtering by {cabin if cache['cabin_filter'] else 'all cabins'}...")
+
+                origin = cache["origin"]
+                destination = cache["destination"]
+                cabin_code = self.CABIN_CODES.get(cabin) if cache["cabin_filter"] else None
+
+                dates = self.search_engine.get_available_dates(origin=origin, destination=destination, cabin=cabin_code)
+                cache["dates"] = [d for d in dates if d.has_availability]
+                cache["current_page"] = 0
+
+                await self._send_calendar_view(query.message, chat_id)
+
+        # Direct toggle
+        elif data == "toggle_direct":
+            if cache:
+                cache["direct_only"] = not cache.get("direct_only", False)
+                await self._send_calendar_view(query.message, chat_id)
+
+        # Saver/Bonus toggle
+        elif data == "toggle_saver":
+            if cache:
+                cache["saver_only"] = not cache.get("saver_only", False)
+                await self._send_calendar_view(query.message, chat_id)
+
+        # Bonus view callbacks
+        elif data.startswith("bonusdate:"):
+            date = data.split(":", 1)[1]
+            if cache:
+                # Set saver_only filter and show date details
+                cache["saver_only"] = True
+                cache["mode"] = "calendar"  # Switch mode for date details
+            await self._send_date_details(query.message, chat_id, date)
+
+        elif data == "alert_bonus":
+            if cache:
+                origin = cache["origin"]
+                destination = cache["destination"]
+                cabin_filter = cache.get("cabin_filter")
+                cabin_code = self.CABIN_CODES.get(cabin_filter) if cabin_filter else None
+
+                if self.db.add_subscription(chat_id, origin, destination, cabin_code, saver_only=True):
+                    cabin_text = cabin_filter or "ANY"
+                    await query.message.reply_text(
+                        f"✅ BONUS alert added: **{origin} → {destination}** ({cabin_text} 🌟BONUS)\n"
+                        f"I'll notify you when bonus tickets appear!",
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await query.message.reply_text("⚠️ Alert already exists.")
+
+        elif data == "refresh_bonus":
+            if cache:
+                await query.message.edit_text("🔄 Refreshing bonus search...")
+                origin = cache["origin"]
+                destination = cache["destination"]
+                cabin_filter = cache.get("cabin_filter")
+
+                # Re-scan for bonus tickets
+                dates = self.search_engine.get_available_dates(origin=origin, destination=destination)
+                available_dates = [d for d in dates if d.has_availability][:15]
+
+                bonus_results = []
+                for d in available_dates:
+                    try:
+                        offers = self.search_engine.search_flights(origin, destination, d.date, cabin_filter)
+                        bonus_offers = [o for o in offers if o.is_saver_award]
+                        seen_cabins = set()
+                        for o in bonus_offers:
+                            if o.cabin_class not in seen_cabins:
+                                bonus_results.append({
+                                    "date": d.date, "cabin": o.cabin_class, "points": o.points,
+                                    "seats": o.available_seats, "stops": o.stops,
+                                    "duration": o.total_duration_minutes, "product": o.product_name,
+                                    "taxes": o.taxes, "currency": o.currency
+                                })
+                                seen_cabins.add(o.cabin_class)
+                        await asyncio.sleep(0.3)
+                    except:
+                        continue
+
+                cache["bonus_results"] = bonus_results
+                cache["mode"] = "bonus"
+                await self._send_bonus_view(query.message, chat_id)
+
+        elif data == "to_calendar_from_bonus":
+            if cache:
+                cache["mode"] = "calendar"
+                cache["saver_only"] = False
+                await query.message.edit_text(f"🔍 Loading calendar for {cache['origin']} → {cache['destination']}...")
+                dates = self.search_engine.get_available_dates(origin=cache["origin"], destination=cache["destination"])
+                cache["dates"] = [d for d in dates if d.has_availability]
+                cache["current_page"] = 0
+                await self._send_calendar_view(query.message, chat_id)
+
+        elif data == "search_bonus_from_cal":
+            if cache:
+                await query.message.edit_text(f"🌟 Scanning for BONUS tickets {cache['origin']} → {cache['destination']}...")
+                origin = cache["origin"]
+                destination = cache["destination"]
+
+                # Scan for bonus tickets using the same engine that works for date clicks
+                dates = cache.get("dates", [])[:10]
+                bonus_results = []
+                total_offers_found = 0
+
+                logger.info(f"BONUS SCAN: Starting scan for {origin} → {destination}, {len(dates)} dates to check")
+
+                for i, d in enumerate(dates):
+                    try:
+                        date_str = d.date
+                        logger.info(f"BONUS SCAN: Checking date {date_str}")
+
+                        # Use self.search_engine with named params - same as _send_date_details
+                        offers = self.search_engine.search_flights(
+                            origin=origin,
+                            destination=destination,
+                            date=date_str,
+                            cabin_filter=None
+                        )
+
+                        total_offers_found += len(offers)
+                        logger.info(f"BONUS SCAN: Got {len(offers)} offers for {date_str}")
+
+                        # Debug: log saver status of each offer
+                        for o in offers[:3]:  # Log first 3
+                            logger.info(f"  Offer: {o.cabin_class} {o.points}pts is_saver={o.is_saver_award} product={o.product_name}")
+
+                        seen_cabins = set()
+                        for o in offers:
+                            if o.is_saver_award and o.cabin_class not in seen_cabins:
+                                bonus_results.append({
+                                    "date": date_str, "cabin": o.cabin_class, "points": o.points,
+                                    "seats": o.available_seats, "stops": o.stops,
+                                    "duration": o.total_duration_minutes, "product": o.product_name,
+                                    "taxes": o.taxes, "currency": o.currency
+                                })
+                                seen_cabins.add(o.cabin_class)
+                                logger.info(f"  FOUND BONUS: {o.cabin_class} {o.points}pts")
+
+                        if (i + 1) % 2 == 0:
+                            await query.message.edit_text(f"🌟 Scanning... {i+1}/{len(dates)} | Found: {len(bonus_results)}")
+                        await asyncio.sleep(0.5)  # Increased delay for rate limiting
+                    except Exception as e:
+                        logger.error(f"Bonus scan error for {d.date}: {e}", exc_info=True)
+                        continue
+
+                logger.info(f"BONUS SCAN: Completed. Found {len(bonus_results)} bonus, {total_offers_found} total offers")
+
+                # If we got 0 offers across all dates, likely a transient API issue
+                if total_offers_found == 0 and len(dates) > 0:
+                    logger.warning(f"BONUS SCAN: Got 0 offers for all dates - possible API issue, retrying once...")
+                    await query.message.edit_text(f"🔄 Retrying scan (API hiccup)...")
+                    await asyncio.sleep(1.0)
+
+                    # Retry with just the first 3 dates
+                    for d in dates[:3]:
+                        try:
+                            offers = self.search_engine.search_flights(origin, destination, d.date, None)
+                            total_offers_found += len(offers)
+                            for o in offers:
+                                if o.is_saver_award:
+                                    bonus_results.append({
+                                        "date": d.date, "cabin": o.cabin_class, "points": o.points,
+                                        "seats": o.available_seats, "stops": o.stops,
+                                        "duration": o.total_duration_minutes, "product": o.product_name,
+                                        "taxes": o.taxes, "currency": o.currency
+                                    })
+                            await asyncio.sleep(0.5)
+                        except Exception as e:
+                            logger.error(f"Retry error for {d.date}: {e}")
+                    logger.info(f"BONUS SCAN RETRY: Found {len(bonus_results)} bonus after retry")
+
+                if bonus_results:
+                    cache["bonus_results"] = bonus_results
+                    cache["mode"] = "bonus"
+                    await self._send_bonus_view(query.message, chat_id)
+                else:
+                    await query.message.edit_text(
+                        f"❌ No BONUS tickets found for {origin} → {destination}\n"
+                        f"Only standard (expensive) tickets available.\n"
+                        f"_Try tapping a date directly to see all offers._",
+                        parse_mode="Markdown"
+                    )
+
+        # View toggle (multi-dest)
+        elif data.startswith("view:"):
+            view_type = data.split(":", 1)[1]
+            if cache:
+                cache["group_by_region"] = (view_type == "region")
+                cache["current_page"] = 0
+                await self._send_multi_dest_view(query.message, chat_id)
+
+        # Destination selection from multi-dest
+        elif data.startswith("dest:"):
+            # Parse new format: dest:f:OSL:BKK or dest:t:OSL:BKK
+            parts = data.split(":")
+            if len(parts) == 4:
+                # New format with explicit direction
+                direction = parts[1]  # "f" (from) or "t" (to)
+                origin = parts[2]
+                destination = parts[3]
+            else:
+                # Legacy fallback (should not happen with new code)
+                route = parts[1]
+                origin, destination = route.split("-")
+
+            # Start new calendar search for this route
+            self.search_cache[chat_id] = {
+                "origin": origin,
+                "destination": destination,
+                "dates": [],
+                "cabin_filter": None,
+                "direct_only": False,
+                "sort_by": "date",
+                "current_page": 0,
+                "mode": "calendar"
+            }
+            await query.message.edit_text(f"🔍 Searching {origin} → {destination}...")
+
+            dates = self.search_engine.get_available_dates(origin=origin, destination=destination)
+            self.search_cache[chat_id]["dates"] = [d for d in dates if d.has_availability]
+            self.search_cache[chat_id]["all_dates"] = self.search_cache[chat_id]["dates"].copy()
+
+            await self._send_calendar_view(query.message, chat_id)
+
+        # Back to calendar
+        elif data == "back":
+            if cache and cache.get("mode") == "calendar":
+                await self._send_calendar_view(query.message, chat_id)
+            elif cache and cache.get("mode") == "multi_dest":
+                await self._send_multi_dest_view(query.message, chat_id)
+            else:
+                await self._send_calendar_view(query.message, chat_id)
+
+        # To calendar from cheapest view
+        elif data == "to_calendar":
+            if cache:
+                cache["mode"] = "calendar"
+                # Fetch dates
+                dates = self.search_engine.get_available_dates(
+                    origin=cache["origin"],
+                    destination=cache["destination"],
+                    cabin=self.CABIN_CODES.get(cache.get("cabin_filter")) if cache.get("cabin_filter") else None
+                )
+                cache["dates"] = [d for d in dates if d.has_availability]
+                cache["current_page"] = 0
+                await self._send_calendar_view(query.message, chat_id)
+
+        # Find cheapest from calendar
+        elif data == "find_cheapest":
+            if cache:
+                await query.message.edit_text("🔍 Scanning for cheapest options...")
+                # Reuse existing data
+                cache["mode"] = "cheapest"
+                cache["cheapest_offers"] = []
+
+                dates_to_check = cache.get("dates", [])[:20]
+
+                for d in dates_to_check:
+                    try:
+                        offers = self.search_engine.search_flights(
+                            origin=cache["origin"],
+                            destination=cache["destination"],
+                            date=d.date,
+                            cabin_filter=cache.get("cabin_filter")
+                        )
+                        for offer in offers:
+                            cache["cheapest_offers"].append((d.date, offer))
+                        await asyncio.sleep(0.3)
+                    except:
+                        continue
+
+                cache["cheapest_offers"].sort(key=lambda x: x[1].points)
+                cache["cheapest_offers"] = cache["cheapest_offers"][:20]
+
+                await self._send_cheapest_view(query.message, chat_id)
+
+        # Refresh
+        elif data == "refresh":
+            if cache:
+                await query.message.edit_text("🔄 Refreshing...")
+                cabin_code = self.CABIN_CODES.get(cache.get("cabin_filter")) if cache.get("cabin_filter") else None
+                dates = self.search_engine.get_available_dates(
+                    origin=cache["origin"],
+                    destination=cache["destination"],
+                    cabin=cabin_code
+                )
+                cache["dates"] = [d for d in dates if d.has_availability]
+                await self._send_calendar_view(query.message, chat_id)
+
+        elif data == "refresh_multi":
+            if cache and cache.get("mode") == "multi_dest":
+                await query.message.edit_text("🔄 Refreshing destinations...")
+                # Re-fetch destinations
+                raw_data = self.search_engine.get_availability_calendar(
+                    origin=cache.get("origin") or "OSL",
+                    destination=cache.get("destination") or "",
+                )
+                # Reparse (simplified)
+                await self._send_multi_dest_view(query.message, chat_id)
+
+        elif data.startswith("refresh_date:"):
+            date = data.split(":", 1)[1]
+            await self._send_date_details(query.message, chat_id, date)
+
+        # Status callbacks
+        elif data == "status:detail":
+            await self._send_status_view(query.message, compact=False, edit=True)
+
+        elif data == "status:compact":
+            await self._send_status_view(query.message, compact=True, edit=True)
+
+        elif data == "status:refresh":
+            await query.message.edit_text("🔄 Refreshing status...")
+            await self._send_status_view(query.message, compact=True, edit=True)
+
+        # Alert
+        elif data == "alert" or data.startswith("alert_date:"):
+            if cache:
+                origin = cache["origin"]
+                destination = cache["destination"]
+                cabin_filter = cache.get("cabin_filter")
+                cabin_code = self.CABIN_CODES.get(cabin_filter) if cabin_filter else None
+
+                if self.db.add_subscription(chat_id, origin, destination, cabin_code):
+                    cabin_text = cabin_filter or "ANY"
+                    await query.message.reply_text(
+                        f"✅ Alert added: **{origin} → {destination}** ({cabin_text})",
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await query.message.reply_text("⚠️ Alert already exists.")
+
+    def run(self):
+        """Start the bot."""
+        if not self.config.telegram_bot_token:
+            logger.error("No token found! Set TELEGRAM_BOT_TOKEN.")
+            return
+
+        app = Application.builder().token(self.config.telegram_bot_token).build()
+
+        app.add_handler(CommandHandler("start", self.start))
+        app.add_handler(CommandHandler("search", self.search))
+        app.add_handler(CommandHandler("deals", self.deals))
+        app.add_handler(CommandHandler("subscribe", self.subscribe))
+        app.add_handler(CommandHandler("subscriptions", self.list_subscriptions))
+        app.add_handler(CommandHandler("unsubscribe", self.unsubscribe))
+        app.add_handler(CommandHandler("status", self.status))
+        app.add_handler(CallbackQueryHandler(self.handle_callback))
+
+        logger.info("Bot started with Phase 2+3 features...")
+        app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    main()
+    bot = SubscriptionBot()
+    bot.run()

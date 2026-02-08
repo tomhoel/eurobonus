@@ -123,20 +123,23 @@ async def capture_session(automated=True):
         logger.error("SAS_EMAIL/SAS_PASSWORD not set in .env.")
         automated = False
     
-    logger.info("Starting browser (nodriver)...")
+    # Headless detection (force True in Docker usually)
+    is_headless = os.getenv("HEADLESS", "false").lower() == "true"
     
-    # Configure browser to be robust (headed required for full auth tokens on Profile API)
+    # Configure browser to be robust
     browser = await uc.start(
-        headless=False,
+        headless=is_headless,
         browser_args=[
             "--no-sandbox", 
             "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage", # Crucial for Docker
             "--disable-blink-features=AutomationControlled", # Helps evade detection
             "--window-size=1920,1080",
-            "--window-position=2000,0", # Move off-screen attempts to minimize impact
+            "--window-position=2000,0",
             "--disable-gpu"
         ],
-        sandbox=False
+        sandbox=False,
+        no_sandbox=True # Attempting both as kwarg to satisfy some uc versions
     )
     
     try:
@@ -193,7 +196,11 @@ async def capture_session(automated=True):
         logger.info(f"✅ Session data saved to {output_file}")
         
     finally:
-        browser.stop()
+        try:
+            # Safer cleanup
+            browser.stop()
+        except:
+            pass
 
 if __name__ == "__main__":
     import sys

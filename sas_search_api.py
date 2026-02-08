@@ -210,44 +210,76 @@ class SASSearchEngine:
     ):
         """
         Initialize the search engine.
-        
+
         Args:
             market: Market identifier (e.g., "no-no" for Norway)
             pos: Point of sale (e.g., "no")
-            cookies: Optional session cookies string
+            cookies: Optional session cookies string (name=value; name2=value2)
             cookies_file: Optional path to file containing cookies
             user_agent: User agent string
         """
         self.market = market
         self.pos = pos
         self.session = requests.Session()
-        
-        # Select initial User-Agent
-        selected_ua = user_agent or random.choice(self.USER_AGENTS)
-        
+
+        # Try to use curl_cffi for better impersonation if available
+        self.use_curl_cffi = False
+        try:
+             from curl_cffi import requests as cur_requests
+             self.session = cur_requests.Session(impersonate="chrome")
+             self.use_curl_cffi = True
+             logger.info("Using curl_cffi for browser impersonation (Cloudflare bypass)")
+        except ImportError:
+             logger.warning("curl_cffi not found. Falling back to standard requests (may hit 403).")
+             self.session = requests.Session()
+
+        # Select initial User-Agent (only if not using curl_cffi)
+        if not self.use_curl_cffi:
+            selected_ua = user_agent or random.choice(self.USER_AGENTS)
+            self.session.headers.update({
+                "User-Agent": selected_ua,
+            })
+
         self.session.headers.update({
-            "User-Agent": selected_ua,
             "Accept": "application/json",
             "Accept-Language": "en-US,en;q=0.9",
         })
-        
+
         # Load session if provided
         self.session_manager = None
         if cookies_file and cookies_file.endswith('.json'):
             from sas_session_manager import SASSessionManager
             self.session_manager = SASSessionManager(cookies_file)
-            self.session.cookies.update(self.session_manager.get_cookie_dict())
+            cookies_dict = self.session_manager.get_cookie_dict()
+            if self.use_curl_cffi:
+                 self.session.cookies.update(cookies_dict)
+            else:
+                 self.session.cookies.update(cookies_dict)
+
             self.session.headers.update({
-                "sas-user-session-id": self.session_manager.get_cookie_dict().get("session_id", ""),
+                "sas-user-session-id": cookies_dict.get("session_id", ""),
                 "channel": "WEB",
                 "pos": self.pos.upper() if self.pos else "NO"
             })
             logger.info(f"Loaded session from {cookies_file}")
         elif cookies_file:
-            cookies = self._load_cookies_from_file(cookies_file)
-        
-        if cookies and not self.session_manager:
+            cookie_str = self._load_cookies_from_file(cookies_file)
+            if cookie_str:
+                self.session.headers["Cookie"] = cookie_str
+        elif cookies:
+            # Handle raw cookie string passed directly
             self.session.headers["Cookie"] = cookies
+            # Try to extract session_id for header
+            for part in cookies.split(";"):
+                if "session_id=" in part:
+                    session_id = part.split("=", 1)[1].strip()
+                    self.session.headers["sas-user-session-id"] = session_id
+                    break
+            self.session.headers.update({
+                "channel": "WEB",
+                "pos": self.pos.upper() if self.pos else "NO"
+            })
+            logger.info("Loaded cookies from string")
     
     @staticmethod
     def _load_cookies_from_file(path: str) -> str:
@@ -263,6 +295,8 @@ class SASSearchEngine:
     
     def rotate_user_agent(self):
         """Rotate the session's User-Agent to a new random one."""
+        if self.use_curl_cffi:
+            return  # curl_cffi handles impersonation
         import random
         new_ua = random.choice(self.USER_AGENTS)
         self.session.headers["User-Agent"] = new_ua
