@@ -18,6 +18,7 @@ import sys
 import logging
 import asyncio
 import re
+import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any, Tuple
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -102,6 +103,13 @@ class SubscriptionBot:
 
         # Cache for search results
         self.search_cache: Dict[str, Dict[str, Any]] = {}
+
+        # Global deals cache (shared across all users)
+        self.deals_cache: Dict[str, Any] = {
+            "data": [],
+            "timestamp": 0,
+            "ttl": 600,  # 10 minutes
+        }
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send a welcome message."""
@@ -290,69 +298,244 @@ class SubscriptionBot:
     # =========================================================================
 
     async def deals(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show hot deals - routes with most available award seats."""
+        """Show hot deals - live scan of all SAS hubs."""
         # Parse optional cabin filter from args
-        cabin_filter = None
-        cabin_name = "All Cabins"
-        
+        cabin_filter = None  # None = all, "eco", "prem", "biz"
         if context.args:
             arg = context.args[0].upper()
-            cabin_map = {
-                "ECONOMY": ("AG", "Economy"), "ECO": ("AG", "Economy"), "AG": ("AG", "Economy"),
-                "PREMIUM": ("AP", "Premium"), "PREM": ("AP", "Premium"), "AP": ("AP", "Premium"),
-                "BUSINESS": ("AB", "Business"), "BIZ": ("AB", "Business"), "AB": ("AB", "Business"),
+            filter_map = {
+                "ECONOMY": "eco", "ECO": "eco", "AG": "eco",
+                "PREMIUM": "prem", "PREM": "prem", "AP": "prem",
+                "BUSINESS": "biz", "BIZ": "biz", "AB": "biz",
             }
-            if arg in cabin_map:
-                cabin_filter, cabin_name = cabin_map[arg]
-        
-        # Get best deals from database
-        deals = self.db.get_best_deals(limit=8, cabin_filter=cabin_filter)
-        
-        if not deals:
+            cabin_filter = filter_map.get(arg)
+
+        # Check cache freshness
+        now = time.time()
+        cache_age = now - self.deals_cache["timestamp"]
+        if self.deals_cache["data"] and cache_age < self.deals_cache["ttl"]:
+            # Use cached data
+            deals_data = self.deals_cache["data"]
+        else:
+            # Fresh fetch
+            status_msg = await update.message.reply_text(
+                "🔍 Scanning hubs for deals...\n"
+                "Checking OSL, CPH, ARN (3 API calls)"
+            )
+            try:
+                deals_data = await self._fetch_live_deals()
+                if not deals_data:
+                    await status_msg.edit_text(
+                        "❌ No deals found. The API might be temporarily unavailable.\n"
+                        "Try again in a few minutes."
+                    )
+                    return
+                await status_msg.delete()
+            except Exception as e:
+                logger.error(f"Deals fetch error: {e}", exc_info=True)
+                await status_msg.edit_text(f"❌ Failed to fetch deals: {str(e)[:100]}")
+                return
+
+        # Filter + sort
+        filtered = self._filter_deals(deals_data, cabin_filter)
+
+        if not filtered:
+            filter_name = {"eco": "Economy", "prem": "Premium", "biz": "Business"}.get(cabin_filter, "")
             await update.message.reply_text(
-                f"🔍 No deals found{' for ' + cabin_name if cabin_filter else ''}.\n"
-                f"The cache might be empty. Try again after the next scan!",
+                f"🔍 No {filter_name} deals found across hubs.\n"
+                f"Try `/deals` to see all cabins.",
                 parse_mode="Markdown"
             )
             return
-        
-        # Build the message
-        header = f"🔥 *Hot Deals* — {cabin_name}\n"
-        header += f"_Top routes with most availability right now_\n\n"
-        
+
+        text = self._format_deals_message(filtered, cabin_filter)
+        keyboard = self._build_deals_keyboard(filtered, cabin_filter)
+
+        await update.message.reply_text(
+            text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+        )
+
+    async def _fetch_live_deals(self) -> List[Dict[str, Any]]:
+        """Fetch live availability from all 3 SAS hubs."""
+        hubs = ["OSL", "CPH", "ARN"]
+        scandinavian_codes = set(REGIONS.get("Scandinavia", []))
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        # Aggregate per (origin, dest)
+        route_data: Dict[str, Dict[str, Any]] = {}
+
+        for hub in hubs:
+            try:
+                raw = self.search_engine.get_availability_calendar(
+                    origin=hub, destination=""
+                )
+                if not raw:
+                    continue
+
+                for dest in raw:
+                    dest_code = dest.get("airportCode") or dest.get("iataCode", "")
+                    if not dest_code:
+                        continue
+
+                    # Skip intra-Scandinavian routes (not interesting deals)
+                    if dest_code in scandinavian_codes:
+                        continue
+
+                    availability = dest.get("availability", {})
+                    outbound = availability.get("outbound", [])
+
+                    route_key = f"{hub}:{dest_code}"
+                    if route_key not in route_data:
+                        route_data[route_key] = {
+                            "origin": hub,
+                            "destination": dest_code,
+                            "region": get_region(dest_code),
+                            "total_eco": 0,
+                            "total_prem": 0,
+                            "total_biz": 0,
+                            "date_count": 0,
+                            "biz_date_count": 0,
+                            "sample_dates": [],
+                        }
+
+                    entry = route_data[route_key]
+
+                    for day in outbound:
+                        date_str = day.get("date", "")
+                        if date_str < today:
+                            continue
+
+                        eco = int(day.get("AG", 0) or 0)
+                        prem = int(day.get("AP", 0) or 0)
+                        biz = int(day.get("AB", 0) or 0)
+
+                        if eco + prem + biz > 0:
+                            entry["total_eco"] += eco
+                            entry["total_prem"] += prem
+                            entry["total_biz"] += biz
+                            entry["date_count"] += 1
+                            if biz > 0:
+                                entry["biz_date_count"] += 1
+                            if len(entry["sample_dates"]) < 10:
+                                entry["sample_dates"].append(date_str)
+
+                await asyncio.sleep(0.3)  # Rate limit between hubs
+            except Exception as e:
+                logger.warning(f"Failed to fetch deals for hub {hub}: {e}")
+                continue
+
+        deals = list(route_data.values())
+
+        # Sort by total seats (all cabins combined)
+        deals.sort(key=lambda d: -(d["total_eco"] + d["total_prem"] + d["total_biz"]))
+
+        # Update cache
+        self.deals_cache["data"] = deals
+        self.deals_cache["timestamp"] = time.time()
+
+        return deals
+
+    def _filter_deals(self, deals: List[Dict], cabin_filter: Optional[str]) -> List[Dict]:
+        """Filter deals by cabin and return top 10."""
+        if not cabin_filter:
+            return deals[:10]
+
+        if cabin_filter == "eco":
+            filtered = [d for d in deals if d["total_eco"] > 0]
+            filtered.sort(key=lambda d: -d["total_eco"])
+        elif cabin_filter == "prem":
+            filtered = [d for d in deals if d["total_prem"] > 0]
+            filtered.sort(key=lambda d: -d["total_prem"])
+        elif cabin_filter == "biz":
+            filtered = [d for d in deals if d["total_biz"] > 0]
+            filtered.sort(key=lambda d: -d["total_biz"])
+        else:
+            filtered = deals
+
+        return filtered[:10]
+
+    def _format_deals_message(self, deals: List[Dict], cabin_filter: Optional[str]) -> str:
+        """Format deals into a Telegram message."""
+        filter_label = {
+            "eco": "Economy", "prem": "Premium", "biz": "Business"
+        }.get(cabin_filter, "All Cabins")
+
+        header = f"🔥 *Hot Deals — {filter_label}*\n"
+        header += "_Best availability across OSL, CPH, ARN_\n\n"
+
         lines = []
         for i, deal in enumerate(deals, 1):
-            cabin_emoji = {"AG": "💺", "AP": "⭐", "AB": "💼"}.get(deal["cabin"], "✈️")
-            cabin_text = {"AG": "Eco", "AP": "Prem", "AB": "Biz"}.get(deal["cabin"], deal["cabin"])
-            
             route = f"{deal['origin']} → {deal['destination']}"
-            
-            # Format date summary
-            if deal["upcoming_dates"]:
-                date_str = ", ".join([d[5:] for d in deal["upcoming_dates"][:3]])  # Show MM-DD
-                if len(deal["upcoming_dates"]) > 3:
-                    date_str += f" +{len(deal['upcoming_dates']) - 3} more"
+            region = deal.get("region", "Other")
+
+            # Seat summary
+            seat_parts = []
+            if deal["total_eco"]:
+                seat_parts.append(f"💺{deal['total_eco']}")
+            if deal["total_prem"]:
+                seat_parts.append(f"💎{deal['total_prem']}")
+            if deal["total_biz"]:
+                seat_parts.append(f"👔{deal['total_biz']}")
+            seats_str = " · ".join(seat_parts) if seat_parts else "—"
+
+            # Date summary
+            date_count = deal["date_count"]
+            sample = deal.get("sample_dates", [])
+            if sample:
+                shown = [d[5:] for d in sample[:3]]  # MM-DD
+                date_str = ", ".join(shown)
+                if len(sample) > 3:
+                    date_str += f" +{len(sample) - 3}"
             else:
-                date_str = "No upcoming dates"
-            
-            line = (
-                f"{i}. *{route}* ({cabin_emoji} {cabin_text})\n"
-                f"   📅 {deal['date_count']} dates, 💺 {deal['total_seats']} total seats\n"
-                f"   🗓 _{date_str}_"
+                date_str = "—"
+
+            lines.append(
+                f"{i}. *{route}* ({region})\n"
+                f"   {seats_str} · {date_count} dates\n"
+                f"   🗓 {date_str}"
             )
-            lines.append(line)
-        
-        # Add footer with tips
-        footer = (
-            "\n\n💡 *Tips:*\n"
-            "• `/deals business` — Business class only\n"
-            "• `/search OSL-BKK` — Search specific route\n"
-            "• `/subscribe OSL BKK` — Get alerts"
-        )
-        
-        message = header + "\n".join(lines) + footer
-        
-        await update.message.reply_text(message, parse_mode="Markdown")
+
+        footer = "\n\n💺 Go · 💎 Plus · 👔 Biz\n💡 _Tap a route to see full calendar_"
+
+        return header + "\n".join(lines) + footer
+
+    def _build_deals_keyboard(self, deals: List[Dict], cabin_filter: Optional[str]) -> List[List[InlineKeyboardButton]]:
+        """Build inline keyboard for deals view."""
+        keyboard = []
+
+        # Route buttons (top 5)
+        route_buttons = []
+        for deal in deals[:5]:
+            origin = deal["origin"]
+            dest = deal["destination"]
+            label = f"{origin}-{dest}"
+            callback = f"dest:f:{origin}:{dest}"
+            route_buttons.append(InlineKeyboardButton(label, callback_data=callback))
+
+        # Split into rows of 3
+        for i in range(0, len(route_buttons), 3):
+            keyboard.append(route_buttons[i:i + 3])
+
+        # Cabin filter buttons
+        active = cabin_filter or "all"
+        eco_label = "💺 Eco ✓" if active == "eco" else "💺 Eco"
+        prem_label = "💎 Plus ✓" if active == "prem" else "💎 Plus"
+        biz_label = "👔 Biz ✓" if active == "biz" else "👔 Biz"
+        all_label = "All ✓" if active == "all" else "All"
+
+        keyboard.append([
+            InlineKeyboardButton(eco_label, callback_data="deals:eco"),
+            InlineKeyboardButton(prem_label, callback_data="deals:prem"),
+            InlineKeyboardButton(biz_label, callback_data="deals:biz"),
+            InlineKeyboardButton(all_label, callback_data="deals:all"),
+        ])
+
+        # Refresh button
+        keyboard.append([
+            InlineKeyboardButton("🔄 Refresh", callback_data="deals:refresh"),
+        ])
+
+        return keyboard
 
     # =========================================================================
     # SEARCH FUNCTIONALITY - PHASE 2 & 3
@@ -1607,6 +1790,48 @@ class SubscriptionBot:
         chat_id = str(update.effective_chat.id)
         data = query.data
         cache = self.search_cache.get(chat_id)
+
+        # Deals callbacks
+        if data.startswith("deals:"):
+            action = data.split(":", 1)[1]
+            if action == "refresh":
+                # Force fresh fetch by resetting cache timestamp
+                self.deals_cache["timestamp"] = 0
+                await query.message.edit_text("🔍 Refreshing deals...\nScanning OSL, CPH, ARN")
+                try:
+                    deals_data = await self._fetch_live_deals()
+                    if not deals_data:
+                        await query.message.edit_text("❌ No deals found. Try again later.")
+                        return
+                except Exception as e:
+                    await query.message.edit_text(f"❌ Refresh failed: {str(e)[:100]}")
+                    return
+                filtered = self._filter_deals(deals_data, None)
+                text = self._format_deals_message(filtered, None)
+                keyboard = self._build_deals_keyboard(filtered, None)
+                await query.message.edit_text(
+                    text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+                )
+            else:
+                # Cabin filter: eco, prem, biz, all
+                cabin_filter = action if action != "all" else None
+                deals_data = self.deals_cache.get("data", [])
+                if not deals_data:
+                    await query.message.edit_text("❌ No cached deals. Tap 🔄 Refresh.")
+                    return
+                filtered = self._filter_deals(deals_data, cabin_filter)
+                if not filtered:
+                    filter_name = {"eco": "Economy", "prem": "Premium", "biz": "Business"}.get(cabin_filter, "")
+                    await query.message.edit_text(
+                        f"🔍 No {filter_name} deals found. Try a different cabin filter.",
+                    )
+                    return
+                text = self._format_deals_message(filtered, cabin_filter)
+                keyboard = self._build_deals_keyboard(filtered, cabin_filter)
+                await query.message.edit_text(
+                    text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+                )
+            return
 
         # Load Details Action
         if data == "load_details":
