@@ -20,6 +20,7 @@ Usage:
 
 import json
 import logging
+import re
 import time
 import random
 from dataclasses import dataclass, field
@@ -150,6 +151,26 @@ class RouteInfo:
     num_flights: int            # Number of segments
     haul_type: str              # LH (Long Haul), SH (Short Haul)
     availability: Dict[str, int]  # Cabin code -> seats
+
+
+@dataclass
+class PartnerFlight:
+    """Parsed partner/SkyTeam award flight."""
+    date: str
+    departure_time: str
+    arrival_time: str
+    origin: str
+    destination: str
+    route: str                          # e.g. "OSL -> CDG -> NRT"
+    carriers: List[str]                 # Carrier codes ["AF", "KL"]
+    carrier_names: List[str]            # ["Air France", "KLM"]
+    stops: int
+    total_duration_minutes: int
+    cabins: List[Dict[str, Any]]        # [{"cabin": "ECONOMY", "points": 30000, "seats": 4, "cash": 500}]
+
+    @property
+    def is_direct(self) -> bool:
+        return self.stops == 0
 
 
 # ============================================================================
@@ -484,7 +505,120 @@ class SASSearchEngine:
             logger.warning("sas-user-session-id missing! Partner API will likely fail.")
             
         return self._request(self.PARTNER_AWARD_URL, params)
-    
+
+    def parse_partner_flights(
+        self, data: Dict[str, Any], origin: str, destination: str, date: str
+    ) -> List["PartnerFlight"]:
+        """Parse raw partner API response into PartnerFlight objects."""
+        flights = []
+        outbound = data.get("outboundFlights", [])
+
+        for flight in outbound:
+            if not isinstance(flight, dict):
+                continue
+
+            segments = flight.get("segments", [])
+            if not segments:
+                continue
+
+            # Build route path and collect carriers
+            airports = []
+            carriers = []
+            carrier_names = []
+
+            for i, seg in enumerate(segments):
+                dep = seg.get("departureAirport", {})
+                dep_code = dep.get("code") if isinstance(dep, dict) else str(dep)
+                airports.append(dep_code)
+
+                if i == len(segments) - 1:
+                    arr = seg.get("arrivalAirport", {})
+                    arr_code = arr.get("code") if isinstance(arr, dict) else str(arr)
+                    airports.append(arr_code)
+
+                # Carrier info (prefer operating carrier)
+                operating = seg.get("operatingCarrier", {})
+                marketing = seg.get("marketingCarrier", {})
+                code = (operating.get("code") if isinstance(operating, dict) else None) or \
+                       (marketing.get("code") if isinstance(marketing, dict) else None)
+                name = (operating.get("name") if isinstance(operating, dict) else None) or \
+                       (marketing.get("name") if isinstance(marketing, dict) else None)
+
+                if code and code not in carriers:
+                    carriers.append(code)
+                if name and name not in carrier_names:
+                    carrier_names.append(name)
+
+            route = " -> ".join(airports)
+
+            # Parse duration
+            total_dur = self._parse_duration(flight.get("totalDuration", 0))
+
+            # Parse departure/arrival times
+            dep_dt = flight.get("departureDateTime", "")
+            arr_dt = flight.get("arrivalDateTime", "")
+            dep_time = dep_dt[11:16] if len(dep_dt) >= 16 else ""
+            arr_time = arr_dt[11:16] if len(arr_dt) >= 16 else ""
+
+            # Parse cabin pricing
+            cabins = []
+            for cabin_data in flight.get("cabins", []):
+                if not isinstance(cabin_data, dict):
+                    continue
+                cabin_name = cabin_data.get("cabin", cabin_data.get("cabinClass", "UNKNOWN"))
+                price = cabin_data.get("price", {})
+                points = price.get("points", 0) if isinstance(price, dict) else 0
+                cash = price.get("cash", 0) if isinstance(price, dict) else 0
+                seats = cabin_data.get("availableSeats", 0)
+                if points:
+                    cabins.append({
+                        "cabin": cabin_name.upper(),
+                        "points": points,
+                        "cash": cash,
+                        "seats": seats,
+                    })
+
+            if cabins:
+                flights.append(PartnerFlight(
+                    date=date,
+                    departure_time=dep_time,
+                    arrival_time=arr_time,
+                    origin=origin,
+                    destination=destination,
+                    route=route,
+                    carriers=carriers,
+                    carrier_names=carrier_names,
+                    stops=max(0, len(segments) - 1),
+                    total_duration_minutes=total_dur,
+                    cabins=cabins,
+                ))
+
+        return flights
+
+    @staticmethod
+    def _parse_duration(raw) -> int:
+        """Parse duration in various formats to minutes."""
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        if isinstance(raw, str):
+            if ":" in raw:
+                parts = raw.split(":")
+                return int(parts[0]) * 60 + int(parts[1])
+            h = m = 0
+            h_match = re.search(r'(\d+)h', raw)
+            m_match = re.search(r'(\d+)m', raw)
+            if h_match:
+                h = int(h_match.group(1))
+            if m_match:
+                m = int(m_match.group(1))
+            if h or m:
+                return h * 60 + m
+            try:
+                return int(raw)
+            except ValueError:
+                pass
+        return 0
+
     # =========================================================================
     # Unified Search Methods
     # =========================================================================

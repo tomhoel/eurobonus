@@ -25,7 +25,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
 from sas_monitor import Config, AvailabilityDatabase
-from sas_search_api import SASSearchEngine, AvailabilityDate, FlightOffer
+from sas_search_api import SASSearchEngine, AvailabilityDate, FlightOffer, PartnerFlight
 
 # Logger setup
 logging.basicConfig(
@@ -51,6 +51,17 @@ REVERSE_SEARCH_HUBS = [
     "LHR", "FRA", "AMS", "CDG", "MUC", "ZRH",  # Europe
     "JFK", "EWR", "LAX", "MIA", "SFO",         # Americas
 ]
+
+# SkyTeam partner airline code -> name mapping
+SKYTEAM_AIRLINES = {
+    "AF": "Air France", "KL": "KLM", "DL": "Delta",
+    "KE": "Korean Air", "MU": "China Eastern", "CZ": "China Southern",
+    "AR": "Aerolineas Argentinas", "AM": "Aeromexico",
+    "CI": "China Airlines", "GA": "Garuda Indonesia", "ME": "MEA",
+    "RO": "TAROM", "VN": "Vietnam Airlines", "SV": "Saudia",
+    "OK": "Czech Airlines", "UX": "Air Europa", "AZ": "ITA Airways",
+    "SK": "SAS", "XQ": "SunExpress", "EY": "Etihad",
+}
 
 def get_region(airport_code: str) -> str:
     """Get region for an airport code."""
@@ -125,6 +136,10 @@ class SubscriptionBot:
             "`/search OSL-*` - All destinations from OSL\n"
             "`/search *-BKK` - All origins to BKK\n"
             "`/search OSL-* 50000pts` - Within budget\n\n"
+            "**Partner Airlines (SkyTeam):**\n"
+            "`/partner OSL-NRT` - Partner flights next 14 days\n"
+            "`/partner OSL-BKK business` - Business class partners\n"
+            "`/partner CPH-CDG Feb` - Specific month\n\n"
             "**Quick Finds:**\n"
             "`/deals` - Hot deals right now\n"
             "`/deals business` - Business class deals\n\n"
@@ -536,6 +551,326 @@ class SubscriptionBot:
         ])
 
         return keyboard
+
+    # =========================================================================
+    # PARTNER (SKYTEAM) SEARCH
+    # =========================================================================
+
+    async def partner(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Search for SkyTeam partner award flights."""
+        chat_id = str(update.effective_chat.id)
+
+        if not context.args:
+            await update.message.reply_text(
+                "🌐 **SkyTeam Partner Award Search**\n\n"
+                "Search Air France, KLM, Delta, Korean Air & more.\n\n"
+                "**Usage:**\n"
+                "`/partner OSL-NRT` - Next 14 days\n"
+                "`/partner OSL-NRT Feb` - Specific month\n"
+                "`/partner CPH-BKK business` - Business class\n"
+                "`/partner OSL-CDG Feb economy` - Combined\n\n"
+                "Requires active SAS EuroBonus session.",
+                parse_mode="Markdown"
+            )
+            return
+
+        parsed = self._parse_search_query(context.args)
+        if parsed.get("error"):
+            await update.message.reply_text(parsed["error"], parse_mode="Markdown")
+            return
+
+        if parsed.get("multi_dest"):
+            await update.message.reply_text(
+                "Partner search doesn't support wildcard routes.\n"
+                "Use a specific route: `/partner OSL-NRT`",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Check session
+        if not self.search_engine.session.headers.get("sas-user-session-id"):
+            await update.message.reply_text(
+                "**Session required** for partner search.\n\n"
+                "The SAS partner API needs an authenticated session.\n"
+                "Run `capture_session.py` to refresh credentials.",
+                parse_mode="Markdown"
+            )
+            return
+
+        await self._search_partner(update, chat_id, parsed)
+
+    def _build_partner_date_list(self, month_filter: Optional[str] = None) -> List[str]:
+        """Build list of dates to scan for partner search."""
+        import calendar as cal_mod
+        now = datetime.now()
+
+        if month_filter:
+            year = int(month_filter[:4])
+            month = int(month_filter[4:6])
+            days_in_month = cal_mod.monthrange(year, month)[1]
+            all_days = [
+                f"{year}-{month:02d}-{d:02d}"
+                for d in range(1, days_in_month + 1)
+            ]
+            # Skip past dates
+            today_str = now.strftime("%Y-%m-%d")
+            all_days = [d for d in all_days if d > today_str]
+            # Sample every other day if too many
+            if len(all_days) > 15:
+                all_days = all_days[::2]
+            return all_days[:15]
+        else:
+            # Default: next 14 days
+            return [
+                (now + timedelta(days=i)).strftime("%Y-%m-%d")
+                for i in range(1, 15)
+            ]
+
+    async def _search_partner(self, update: Update, chat_id: str, parsed: Dict):
+        """Scan multiple dates for partner award flights."""
+        origin = parsed["origin"]
+        destination = parsed["destination"]
+        month_filter = parsed.get("month")
+        cabin_filter = parsed.get("cabin_filter")
+
+        dates_to_scan = self._build_partner_date_list(month_filter)
+
+        status_msg = await update.message.reply_text(
+            f"🌐 **Partner: {origin} → {destination}**\n"
+            f"Scanning {len(dates_to_scan)} dates for SkyTeam flights...\n"
+            f"Progress: 0/{len(dates_to_scan)}"
+        )
+
+        all_flights: List[PartnerFlight] = []
+        rate_limit_count = 0
+
+        for i, date in enumerate(dates_to_scan):
+            try:
+                raw = self.search_engine.get_partner_awards(origin, destination, date)
+                if raw and raw.get("outboundFlights"):
+                    parsed_flights = self.search_engine.parse_partner_flights(
+                        raw, origin, destination, date
+                    )
+                    if cabin_filter:
+                        parsed_flights = [
+                            f for f in parsed_flights
+                            if any(c["cabin"] == cabin_filter for c in f.cabins)
+                        ]
+                    all_flights.extend(parsed_flights)
+
+                if (i + 1) % 3 == 0 or i == len(dates_to_scan) - 1:
+                    await status_msg.edit_text(
+                        f"🌐 Partner: {origin} → {destination}\n"
+                        f"Progress: {i + 1}/{len(dates_to_scan)} | "
+                        f"Found: {len(all_flights)} flight(s)"
+                    )
+
+                await asyncio.sleep(0.5)
+
+            except Exception as e:
+                if "429" in str(e):
+                    rate_limit_count += 1
+                    if rate_limit_count >= 2:
+                        break
+                    await asyncio.sleep(30)
+                else:
+                    logger.warning(f"Partner scan error for {date}: {e}")
+                    continue
+
+        if not all_flights:
+            await status_msg.edit_text(
+                f"❌ No partner flights found: {origin} → {destination}\n\n"
+                f"This route may not have SkyTeam availability.\n"
+                f"Try `/search {origin}-{destination}` for SAS flights.",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Cache results (keep unfiltered copy for cabin toggling)
+        self.search_cache[chat_id] = {
+            "origin": origin,
+            "destination": destination,
+            "partner_flights": all_flights,
+            "partner_flights_all": all_flights,  # unfiltered backup
+            "cabin_filter": cabin_filter,
+            "current_page": 0,
+            "mode": "partner",
+        }
+
+        await self._send_partner_view(status_msg, chat_id)
+
+    async def _send_partner_view(self, message, chat_id: str, page: int = 0, edit: bool = True):
+        """Render partner search results with inline keyboard."""
+        cache = self.search_cache.get(chat_id)
+        if not cache or cache.get("mode") != "partner":
+            if edit:
+                await message.edit_text("Search expired. Please search again.")
+            return
+
+        origin = cache["origin"]
+        destination = cache["destination"]
+        flights = cache["partner_flights"]
+        cabin_filter = cache.get("cabin_filter")
+
+        PAGE_SIZE = 5
+        total_pages = max(1, (len(flights) + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = max(0, min(page, total_pages - 1))
+        cache["current_page"] = page
+
+        start = page * PAGE_SIZE
+        page_flights = flights[start:start + PAGE_SIZE]
+
+        # Collect all unique airlines across all results
+        all_carriers = set()
+        for f in flights:
+            for name in f.carrier_names:
+                all_carriers.add(name)
+            for code in f.carriers:
+                if code in SKYTEAM_AIRLINES:
+                    all_carriers.add(SKYTEAM_AIRLINES[code])
+
+        # Header
+        header = f"🌐 **Partner Flights: {origin} → {destination}**\n"
+        if all_carriers:
+            header += f"Airlines: {', '.join(sorted(all_carriers))}\n"
+        header += f"{len(flights)} flight(s)"
+        if cabin_filter:
+            cabin_label = {"ECONOMY": "Economy", "PREMIUM": "Premium", "BUSINESS": "Business"}.get(cabin_filter, cabin_filter)
+            header += f" ({cabin_label})"
+        if total_pages > 1:
+            header += f" | Page {page + 1}/{total_pages}"
+        header += "\n\n"
+
+        # Body
+        lines = []
+        current_date = None
+        cabin_emoji = {"ECONOMY": "💺", "PREMIUM": "💎", "BUSINESS": "👔", "FIRST": "👑"}
+
+        for f in page_flights:
+            if f.date != current_date:
+                if current_date is not None:
+                    lines.append("")
+                date_obj = datetime.strptime(f.date, "%Y-%m-%d")
+                lines.append(f"**{date_obj.strftime('%a %d %b')}**")
+                current_date = f.date
+
+            carrier_display = [SKYTEAM_AIRLINES.get(c, c) for c in f.carriers]
+            carrier_str = " / ".join(carrier_display)
+
+            hours = f.total_duration_minutes // 60
+            mins = f.total_duration_minutes % 60
+            dur_str = f"{hours}h{mins:02d}m" if f.total_duration_minutes else ""
+            stops_str = "Direct" if f.is_direct else f"{f.stops} stop{'s' if f.stops > 1 else ''}"
+
+            lines.append(f"  ✈️ `{f.departure_time}→{f.arrival_time}` | {carrier_str}")
+            detail_parts = [stops_str]
+            if dur_str:
+                detail_parts.append(dur_str)
+            lines.append(f"     {f.route} | {' | '.join(detail_parts)}")
+
+            for c in f.cabins:
+                if cabin_filter and c["cabin"] != cabin_filter:
+                    continue
+                emoji = cabin_emoji.get(c["cabin"], "✈️")
+                seats_str = f" | {c['seats']} seats" if c.get("seats") else ""
+                lines.append(f"     {emoji} `{c['points']:,}` pts{seats_str}")
+
+        body = "\n".join(lines)
+
+        # Inline keyboard
+        keyboard = []
+
+        # Pagination
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"partner_page:{page - 1}"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"partner_page:{page + 1}"))
+        if nav:
+            keyboard.append(nav)
+
+        # Date buttons for this page
+        unique_dates = list(dict.fromkeys(f.date for f in page_flights))
+        date_buttons = []
+        for d in unique_dates:
+            d_obj = datetime.strptime(d, "%Y-%m-%d")
+            date_buttons.append(
+                InlineKeyboardButton(d_obj.strftime("%d %b"), callback_data=f"partner_date:{d}")
+            )
+        if date_buttons:
+            for i in range(0, len(date_buttons), 5):
+                keyboard.append(date_buttons[i:i + 5])
+
+        # Cabin filters
+        keyboard.append([
+            InlineKeyboardButton("💺 Eco", callback_data="partner_cabin:ECONOMY"),
+            InlineKeyboardButton("💎 Plus", callback_data="partner_cabin:PREMIUM"),
+            InlineKeyboardButton("👔 Biz", callback_data="partner_cabin:BUSINESS"),
+            InlineKeyboardButton("All", callback_data="partner_cabin:ALL"),
+        ])
+
+        # Actions
+        keyboard.append([
+            InlineKeyboardButton("🔄 Refresh", callback_data="partner_refresh"),
+            InlineKeyboardButton("🔔 Alert", callback_data="partner_alert"),
+        ])
+        keyboard.append([
+            InlineKeyboardButton("📅 SAS Search", callback_data="partner_to_sas"),
+        ])
+
+        text = header + body
+        if len(text) > 4000:
+            text = text[:3950] + "\n\n_...truncated. Use page navigation._"
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        if edit:
+            await message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        else:
+            await message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+    async def _send_partner_date_detail(self, message, chat_id: str, date: str, flights: List[PartnerFlight]):
+        """Show detailed partner flights for a specific date."""
+        date_obj = datetime.strptime(date, "%Y-%m-%d")
+        header = f"🌐 **Partner Flights — {date_obj.strftime('%A, %d %B %Y')}**\n\n"
+
+        lines = []
+        cabin_emoji = {"ECONOMY": "💺", "PREMIUM": "💎", "BUSINESS": "👔", "FIRST": "👑"}
+
+        for i, f in enumerate(flights):
+            carrier_display = [SKYTEAM_AIRLINES.get(c, c) for c in f.carriers]
+            carrier_str = " / ".join(carrier_display)
+
+            hours = f.total_duration_minutes // 60
+            mins = f.total_duration_minutes % 60
+            dur_str = f"{hours}h{mins:02d}m" if f.total_duration_minutes else ""
+            stops_str = "Direct" if f.is_direct else f"{f.stops} stop{'s' if f.stops > 1 else ''}"
+
+            lines.append(f"**Option {i + 1}: {carrier_str}**")
+            lines.append(f"  `{f.departure_time} → {f.arrival_time}` | {stops_str} | {dur_str}")
+            lines.append(f"  Route: {f.route}")
+
+            for c in f.cabins:
+                emoji = cabin_emoji.get(c["cabin"], "✈️")
+                seats_str = f" | {c['seats']} seats" if c.get("seats") else ""
+                cash_str = f" + {c['cash']:.0f} cash" if c.get("cash") else ""
+                lines.append(f"  {emoji} {c['cabin']}: `{c['points']:,}` pts{cash_str}{seats_str}")
+
+            lines.append("")
+
+        body = "\n".join(lines)
+
+        keyboard = [
+            [InlineKeyboardButton("⬅️ Back to Results", callback_data="partner_back")],
+            [InlineKeyboardButton("🔔 Alert", callback_data="partner_alert")],
+        ]
+
+        text = header + body
+        if len(text) > 4000:
+            text = text[:3950] + "\n\n_...truncated._"
+
+        await message.edit_text(
+            text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+        )
 
     # =========================================================================
     # SEARCH FUNCTIONALITY - PHASE 2 & 3
@@ -2186,6 +2521,108 @@ class SubscriptionBot:
             await query.message.edit_text("🔄 Refreshing status...")
             await self._send_status_view(query.message, compact=True, edit=True)
 
+        # Partner callbacks
+        elif data.startswith("partner_page:"):
+            page = int(data.split(":", 1)[1])
+            await self._send_partner_view(query.message, chat_id, page=page)
+
+        elif data.startswith("partner_date:"):
+            date = data.split(":", 1)[1]
+            if cache and cache.get("mode") == "partner":
+                date_flights = [f for f in cache["partner_flights"] if f.date == date]
+                if date_flights:
+                    await self._send_partner_date_detail(query.message, chat_id, date, date_flights)
+                else:
+                    await query.message.edit_text(f"No partner flights on {date}.")
+
+        elif data.startswith("partner_cabin:"):
+            cabin = data.split(":", 1)[1]
+            if cache and cache.get("mode") == "partner":
+                all_flights = cache.get("partner_flights_all", cache["partner_flights"])
+                if cabin == "ALL":
+                    cache["cabin_filter"] = None
+                    cache["partner_flights"] = all_flights
+                else:
+                    cache["cabin_filter"] = cabin
+                    cache["partner_flights"] = [
+                        f for f in all_flights
+                        if any(c["cabin"] == cabin for c in f.cabins)
+                    ]
+                cache["current_page"] = 0
+                await self._send_partner_view(query.message, chat_id)
+
+        elif data == "partner_refresh":
+            if cache and cache.get("mode") == "partner":
+                origin = cache["origin"]
+                destination = cache["destination"]
+                cabin_filter = cache.get("cabin_filter")
+                await query.message.edit_text(
+                    f"🔄 Refreshing partner search {origin} → {destination}..."
+                )
+                dates_to_scan = self._build_partner_date_list()
+                all_flights: List[PartnerFlight] = []
+                for i, date in enumerate(dates_to_scan):
+                    try:
+                        raw = self.search_engine.get_partner_awards(origin, destination, date)
+                        if raw and raw.get("outboundFlights"):
+                            parsed_flights = self.search_engine.parse_partner_flights(
+                                raw, origin, destination, date
+                            )
+                            if cabin_filter:
+                                parsed_flights = [
+                                    f for f in parsed_flights
+                                    if any(c["cabin"] == cabin_filter for c in f.cabins)
+                                ]
+                            all_flights.extend(parsed_flights)
+                        if (i + 1) % 3 == 0:
+                            await query.message.edit_text(
+                                f"🔄 Refreshing... {i + 1}/{len(dates_to_scan)} | Found: {len(all_flights)}"
+                            )
+                        await asyncio.sleep(0.5)
+                    except Exception as e:
+                        if "429" in str(e):
+                            break
+                        continue
+                cache["partner_flights"] = all_flights
+                cache["partner_flights_all"] = all_flights
+                cache["current_page"] = 0
+                await self._send_partner_view(query.message, chat_id)
+
+        elif data == "partner_alert":
+            if cache and cache.get("mode") == "partner":
+                origin = cache["origin"]
+                destination = cache["destination"]
+                if self.db.add_subscription(chat_id, origin, destination, None):
+                    await query.message.reply_text(
+                        f"🔔 Alert added: **{origin} → {destination}**\n"
+                        f"You'll be notified when availability changes.",
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await query.message.reply_text("⚠️ Alert already exists.")
+
+        elif data == "partner_to_sas":
+            if cache:
+                origin = cache.get("origin")
+                destination = cache.get("destination")
+                await query.message.edit_text(f"🔍 Searching SAS flights {origin} → {destination}...")
+                dates = self.search_engine.get_available_dates(origin=origin, destination=destination)
+                self.search_cache[chat_id] = {
+                    "origin": origin,
+                    "destination": destination,
+                    "dates": [d for d in dates if d.has_availability],
+                    "cabin_filter": None,
+                    "direct_only": False,
+                    "sort_by": "date",
+                    "current_page": 0,
+                    "mode": "calendar"
+                }
+                await self._send_calendar_view(query.message, chat_id)
+
+        elif data == "partner_back":
+            if cache and cache.get("mode") == "partner":
+                await self._send_partner_view(query.message, chat_id, page=cache.get("current_page", 0))
+
         # Alert
         elif data == "alert" or data.startswith("alert_date:"):
             if cache:
@@ -2214,6 +2651,7 @@ class SubscriptionBot:
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("search", self.search))
         app.add_handler(CommandHandler("deals", self.deals))
+        app.add_handler(CommandHandler("partner", self.partner))
         app.add_handler(CommandHandler("subscribe", self.subscribe))
         app.add_handler(CommandHandler("subscriptions", self.list_subscriptions))
         app.add_handler(CommandHandler("unsubscribe", self.unsubscribe))
