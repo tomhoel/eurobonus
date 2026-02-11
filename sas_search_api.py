@@ -509,7 +509,14 @@ class SASSearchEngine:
     def parse_partner_flights(
         self, data: Dict[str, Any], origin: str, destination: str, date: str
     ) -> List["PartnerFlight"]:
-        """Parse raw partner API response into PartnerFlight objects."""
+        """Parse raw partner API response into PartnerFlight objects.
+
+        Handles the actual SAS partner API response format where:
+        - Times use startTimeInLocal/endTimeInLocal or startDateTimeInLocal
+        - Duration is connectionDuration or totalDuration (string "15h 40m")
+        - Price is nested: cabins[].price.points (top-level) or price.totalPrice
+        - Stops count from flight.stops (list) or len(segments)-1
+        """
         flights = []
         outbound = data.get("outboundFlights", [])
 
@@ -551,14 +558,23 @@ class SASSearchEngine:
 
             route = " -> ".join(airports)
 
-            # Parse duration
-            total_dur = self._parse_duration(flight.get("totalDuration", 0))
+            # Parse duration (try multiple field names)
+            dur_raw = flight.get("totalDuration") or flight.get("connectionDuration", 0)
+            total_dur = self._parse_duration(dur_raw)
 
-            # Parse departure/arrival times
-            dep_dt = flight.get("departureDateTime", "")
-            arr_dt = flight.get("arrivalDateTime", "")
-            dep_time = dep_dt[11:16] if len(dep_dt) >= 16 else ""
-            arr_time = arr_dt[11:16] if len(arr_dt) >= 16 else ""
+            # Parse departure/arrival times (try multiple field names)
+            dep_time = flight.get("startTimeInLocal", "")
+            arr_time = flight.get("endTimeInLocal", "")
+            if not dep_time:
+                dep_dt = flight.get("startDateTimeInLocal") or flight.get("departureDateTime", "")
+                dep_time = dep_dt[11:16] if len(str(dep_dt)) >= 16 else ""
+            if not arr_time:
+                arr_dt = flight.get("endDateTimeInLocal") or flight.get("arrivalDateTime", "")
+                arr_time = arr_dt[11:16] if len(str(arr_dt)) >= 16 else ""
+
+            # Stops: can be a list (partner API) or int
+            stops_raw = flight.get("stops", [])
+            num_stops = len(stops_raw) if isinstance(stops_raw, list) else int(stops_raw) if stops_raw else max(0, len(segments) - 1)
 
             # Parse cabin pricing
             cabins = []
@@ -567,8 +583,13 @@ class SASSearchEngine:
                     continue
                 cabin_name = cabin_data.get("cabin", cabin_data.get("cabinClass", "UNKNOWN"))
                 price = cabin_data.get("price", {})
-                points = price.get("points", 0) if isinstance(price, dict) else 0
-                cash = price.get("cash", 0) if isinstance(price, dict) else 0
+                if isinstance(price, dict):
+                    # Points at top level of price dict
+                    points = price.get("points", 0) or price.get("totalPrice", 0)
+                    cash = price.get("totalTax", 0) or price.get("cash", 0)
+                else:
+                    points = 0
+                    cash = 0
                 seats = cabin_data.get("availableSeats", 0)
                 if points:
                     cabins.append({
@@ -588,7 +609,7 @@ class SASSearchEngine:
                     route=route,
                     carriers=carriers,
                     carrier_names=carrier_names,
-                    stops=max(0, len(segments) - 1),
+                    stops=num_stops,
                     total_duration_minutes=total_dur,
                     cabins=cabins,
                 ))

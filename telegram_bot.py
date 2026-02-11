@@ -627,7 +627,7 @@ class SubscriptionBot:
             ]
 
     async def _search_partner(self, update: Update, chat_id: str, parsed: Dict):
-        """Scan multiple dates for partner award flights."""
+        """Scan multiple dates for partner/award flights."""
         origin = parsed["origin"]
         destination = parsed["destination"]
         month_filter = parsed.get("month")
@@ -637,33 +637,108 @@ class SubscriptionBot:
 
         status_msg = await update.message.reply_text(
             f"🌐 **Partner: {origin} → {destination}**\n"
-            f"Scanning {len(dates_to_scan)} dates for SkyTeam flights...\n"
+            f"Scanning {len(dates_to_scan)} dates for award flights...\n"
             f"Progress: 0/{len(dates_to_scan)}"
         )
 
         all_flights: List[PartnerFlight] = []
+        use_fallback = False
         rate_limit_count = 0
 
-        for i, date in enumerate(dates_to_scan):
-            try:
-                raw = self.search_engine.get_partner_awards(origin, destination, date)
-                if raw and raw.get("outboundFlights"):
-                    parsed_flights = self.search_engine.parse_partner_flights(
-                        raw, origin, destination, date
-                    )
-                    if cabin_filter:
-                        parsed_flights = [
-                            f for f in parsed_flights
-                            if any(c["cabin"] == cabin_filter for c in f.cabins)
-                        ]
-                    all_flights.extend(parsed_flights)
+        # Try partner API on first date to check auth
+        try:
+            test_raw = self.search_engine.get_partner_awards(
+                origin, destination, dates_to_scan[0]
+            )
+            if test_raw and test_raw.get("outboundFlights"):
+                parsed_flights = self.search_engine.parse_partner_flights(
+                    test_raw, origin, destination, dates_to_scan[0]
+                )
+                all_flights.extend(parsed_flights)
+        except Exception as e:
+            if "401" in str(e) or "403" in str(e):
+                use_fallback = True
+                logger.info("Partner API auth failed, falling back to offers API")
+                await status_msg.edit_text(
+                    f"🌐 **{origin} → {destination}**\n"
+                    f"Using award search (partner API needs session refresh)...\n"
+                    f"Progress: 0/{len(dates_to_scan)}"
+                )
+            else:
+                logger.warning(f"Partner API error: {e}")
 
-                if (i + 1) % 3 == 0 or i == len(dates_to_scan) - 1:
-                    await status_msg.edit_text(
-                        f"🌐 Partner: {origin} → {destination}\n"
-                        f"Progress: {i + 1}/{len(dates_to_scan)} | "
-                        f"Found: {len(all_flights)} flight(s)"
+        start_idx = 0 if use_fallback else 1  # Skip first date if already checked
+
+        for i, date in enumerate(dates_to_scan[start_idx:], start=start_idx):
+            try:
+                if use_fallback:
+                    # Use regular offers API (works with session cookies)
+                    offers = self.search_engine.search_flights(
+                        origin=origin, destination=destination,
+                        date=date, cabin_filter=cabin_filter
                     )
+                    # Convert FlightOffer objects to PartnerFlight format
+                    seen_flights = set()
+                    for o in offers:
+                        # Build route and carrier info from segments
+                        airports = []
+                        carriers = []
+                        carrier_names = []
+                        for s in o.segments:
+                            airports.append(s.departure_airport)
+                            code = s.carrier or s.carrier_name or "SK"
+                            name = s.carrier_name or SKYTEAM_AIRLINES.get(code, code)
+                            if code and code not in carriers:
+                                carriers.append(code)
+                            if name and name not in carrier_names:
+                                carrier_names.append(name)
+                        if o.segments:
+                            airports.append(o.segments[-1].arrival_airport)
+
+                        route = " -> ".join(airports)
+                        flight_key = f"{date}_{route}_{o.cabin_class}"
+                        if flight_key in seen_flights:
+                            continue
+                        seen_flights.add(flight_key)
+
+                        all_flights.append(PartnerFlight(
+                            date=date,
+                            departure_time=o.segments[0].departure_time if o.segments else "",
+                            arrival_time=o.segments[-1].arrival_time if o.segments else "",
+                            origin=origin,
+                            destination=destination,
+                            route=route,
+                            carriers=carriers,
+                            carrier_names=carrier_names,
+                            stops=o.stops,
+                            total_duration_minutes=o.total_duration_minutes,
+                            cabins=[{
+                                "cabin": o.cabin_class,
+                                "points": o.points,
+                                "cash": o.taxes,
+                                "seats": o.available_seats,
+                            }],
+                        ))
+                else:
+                    # Use partner API
+                    raw = self.search_engine.get_partner_awards(origin, destination, date)
+                    if raw and raw.get("outboundFlights"):
+                        parsed_flights = self.search_engine.parse_partner_flights(
+                            raw, origin, destination, date
+                        )
+                        if cabin_filter:
+                            parsed_flights = [
+                                f for f in parsed_flights
+                                if any(c["cabin"] == cabin_filter for c in f.cabins)
+                            ]
+                        all_flights.extend(parsed_flights)
+
+                # Update progress on every date
+                await status_msg.edit_text(
+                    f"🌐 {'Award' if use_fallback else 'Partner'}: {origin} → {destination}\n"
+                    f"Progress: {i + 1}/{len(dates_to_scan)} | "
+                    f"Found: {len(all_flights)} flight(s)"
+                )
 
                 await asyncio.sleep(0.5)
 
@@ -675,13 +750,21 @@ class SubscriptionBot:
                     await asyncio.sleep(30)
                 else:
                     logger.warning(f"Partner scan error for {date}: {e}")
+                    # Still update progress on errors
+                    try:
+                        await status_msg.edit_text(
+                            f"🌐 {origin} → {destination}\n"
+                            f"Progress: {i + 1}/{len(dates_to_scan)} | "
+                            f"Found: {len(all_flights)} flight(s)"
+                        )
+                    except Exception:
+                        pass
                     continue
 
         if not all_flights:
             await status_msg.edit_text(
-                f"❌ No partner flights found: {origin} → {destination}\n\n"
-                f"This route may not have SkyTeam availability.\n"
-                f"Try `/search {origin}-{destination}` for SAS flights.",
+                f"❌ No award flights found: {origin} → {destination}\n\n"
+                f"Try `/search {origin}-{destination}` for calendar view.",
                 parse_mode="Markdown"
             )
             return
@@ -695,6 +778,7 @@ class SubscriptionBot:
             "cabin_filter": cabin_filter,
             "current_page": 0,
             "mode": "partner",
+            "use_fallback": use_fallback,
         }
 
         await self._send_partner_view(status_msg, chat_id)
