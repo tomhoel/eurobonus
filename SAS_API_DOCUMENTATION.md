@@ -255,6 +255,18 @@ Instead of brute-forcing all possible IATA codes, tools should iterate through t
 
 ---
 
+### 8. Frontend URLs & Scraping Targets
+
+These frontend URLs and parameters can be used as scraping targets or launch parameters for automated browsers or monitoring tools.
+
+*   `https://www.sas.no/award-finder`: The main frontend application for finding award seats. Using a browser emulator on this page can yield cached availability dynamically loaded via Javascript.
+*   `https://www.sas.no/book/flights/?search=OW_OSL-BKK-20260225_a1c0i0y0&view=upsell&bookingFlow=points&sortBy=rec&filterBy=all`: Direct link to the booking flow for points. This bypasses the calendar view and immediately requests real-time pricing for the specified route and date.
+*   `https://www.sas.no/book/flights/?search=OW_OSL-BKK-20260225_a1c0i0y0&view=upsell&bookingFlow=points&sortBy=rec&filterBy=all&out_class=ECONOMY&out_sub_class=ECONOMY%20BONUS&out_flight_number=SK459,SK973`: Deep link directly pre-selecting specific flight numbers (`SK459`, `SK973`), cabin class (`ECONOMY`), and bonus product type (`ECONOMY BONUS`). Useful for jumping straight to the passenger details page in an automated booking flow.
+*   `https://www.sas.no/reisemal`: SAS destinations page. Can be scraped to natively extract all available destinations.
+*   `https://www.sas.no/lavpriskalender`: The low fare calendar. Useful for finding the cheapest cash fares across broad swaths of dates.
+
+---
+
 ## Critical: Data Freshness & Ticket Types
 
 ### Endpoint Data Freshness
