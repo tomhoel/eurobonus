@@ -255,15 +255,42 @@ Instead of brute-forcing all possible IATA codes, tools should iterate through t
 
 ---
 
-### 8. Frontend URLs & Scraping Targets
+### 8. Frontend Deep-Link "APIs" & Scraping Targets
 
-These frontend URLs and parameters can be used as scraping targets or launch parameters for automated browsers or monitoring tools.
+SAS provides structured frontend URLs that function similarly to an API by allowing you to deep-link directly into specific booking flows, pre-select flights, and enforce points-based searches. These URLs are ideal launch parameters for automated browsers (like `nodriver` or `playwright`) when simulating user flows.
 
-*   `https://www.sas.no/award-finder`: The main frontend application for finding award seats. Using a browser emulator on this page can yield cached availability dynamically loaded via Javascript.
-*   `https://www.sas.no/book/flights/?search=OW_OSL-BKK-20260225_a1c0i0y0&view=upsell&bookingFlow=points&sortBy=rec&filterBy=all`: Direct link to the booking flow for points. This bypasses the calendar view and immediately requests real-time pricing for the specified route and date.
-*   `https://www.sas.no/book/flights/?search=OW_OSL-BKK-20260225_a1c0i0y0&view=upsell&bookingFlow=points&sortBy=rec&filterBy=all&out_class=ECONOMY&out_sub_class=ECONOMY%20BONUS&out_flight_number=SK459,SK973`: Deep link directly pre-selecting specific flight numbers (`SK459`, `SK973`), cabin class (`ECONOMY`), and bonus product type (`ECONOMY BONUS`). Useful for jumping straight to the passenger details page in an automated booking flow.
-*   `https://www.sas.no/reisemal`: SAS destinations page. Can be scraped to natively extract all available destinations.
-*   `https://www.sas.no/lavpriskalender`: The low fare calendar. Useful for finding the cheapest cash fares across broad swaths of dates.
+#### A. The Booking Deep-Link API (`/book/flights/`)
+
+This URL pattern allows you to bypass the search page and jump directly to flight selection or passenger details. 
+
+**Base URL:** 
+`https://www.sas.no/book/flights/`
+
+**Query Parameters:**
+
+| Parameter | Example Value | Description |
+|-----------|---------------|-------------|
+| `search` | `OW_OSL-BKK-20260225_a1c0i0y0` | **The Core Search String.** Format: `<TripType>_<Origin>-<Destination>-<Date>_<Passengers>`<br>- **TripType**: `OW` (One Way) or `RT` (Round Trip).<br>- **Date**: `YYYYMMDD` (For RT, use `YYYYMMDD-YYYYMMDD`).<br>- **Passengers**: `a` (Adult), `c` (Child), `i` (Infant), `y` (Youth). E.g., `a1c0i0y0` = 1 Adult. |
+| `bookingFlow` | `points` | Forces the search to yield EuroBonus award availability rather than cash (`revenue`). |
+| `out_class` | `ECONOMY` | Pre-selects the cabin class for the outbound journey (`ECONOMY`, `PREMIUM`, `BUSINESS`). |
+| `out_sub_class` | `ECONOMY BONUS` | Pre-selects the specific fare product (e.g., `ECONOMY BONUS`, `PLUS BONUS`, `BUSINESS BONUS`). |
+| `out_flight_number`| `SK459,SK973` | Comma-separated list of flight numbers to automatically select for the outbound journey. |
+| `view` | `upsell` | Forces the expanded cabin upsell view. |
+| `sortBy` | `rec` | Sorting order (`rec` = Recommended). |
+| `filterBy` | `all` | Filter applied to the results. |
+
+**Example Usage:** Jump directly to a pre-selected Business Bonus flight:
+```text
+https://www.sas.no/book/flights/?search=OW_OSL-BKK-20260225_a1c0i0y0&view=upsell&bookingFlow=points&sortBy=rec&filterBy=all&out_class=BUSINESS&out_sub_class=BUSINESS%20BONUS&out_flight_number=SK459,SK973
+```
+
+#### B. Discovery & Calendar Scraping Targets
+
+These pages are React/Next.js applications that load availability data dynamically via internal XHR requests. When scraping these via browser automation, monitoring the Network tab allows you to intercept the underlying `/bff/` and `/api/` calls.
+
+*   `https://www.sas.no/award-finder`: **The Award Calendar.** A dedicated interface for finding pure EuroBonus seats. Use this to visually scrape month-long cached award data.
+*   `https://www.sas.no/lavpriskalender`: **The Low Fare Calendar.** Useful for scraping the lowest available cash fares across broad swaths of dates. Driven by SAS's internal low-fare offers API.
+*   `https://www.sas.no/reisemal`: **Destinations Map.** Can be scraped to extract all active nodes in the SAS network, powering automated routing graphs.
 
 ---
 
