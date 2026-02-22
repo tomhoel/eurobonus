@@ -145,7 +145,7 @@ GET /api/offers/flights
 
 #### Response Structure
 
-The response is complex. The key data resides in `outboundFlights` -> `cabins` -> `products` -> `price`.
+The response is complex. The key data resides in `outboundFlights` -> `cabins` -> `products` -> `price`. When the `view=upsell` query parameter is active, the product dictionary is heavily enriched with cabin service details.
 
 ```json
 {
@@ -156,11 +156,39 @@ The response is complex. The key data resides in `outboundFlights` -> `cabins` -
         "BUSINESS": {
            "products": {
               "O_1": {
+                 "productName": "BUSINESS BONUS",
+                 "productType": "BUSINESS BONUS",
                  "price": {
                     "points": 108000,
                     "totalTax": 1234.00,
                     "currency": "NOK"
-                 }
+                 },
+                 "fares": [
+                   {
+                     "avlSeats": 4,
+                     "bookingClass": "I"
+                   }
+                 ],
+                 "features": [
+                   {
+                     "name": "Baggage",
+                     "description": "2 checked bags (23kg), 2 carry-on bags (8kg)",
+                     "type": "BAGGAGE",
+                     "included": true
+                   },
+                   {
+                     "name": "Lounge",
+                     "description": "Access to SAS Lounges",
+                     "type": "LOUNGE",
+                     "included": true
+                   },
+                   {
+                     "name": "Refundable",
+                     "description": "Free cancellation up to 24h",
+                     "type": "REFUND",
+                     "included": true
+                   }
+                 ]
               }
            }
         }
@@ -169,6 +197,19 @@ The response is complex. The key data resides in `outboundFlights` -> `cabins` -
   }
 }
 ```
+
+#### Extracting Fare Details & Features (Upsell View)
+
+When users click on a specific flight class in the frontend (e.g., expanding the "Business Bonus" column), a modal appears with baggage, lounge, and refund policies. This data is driven entirely by the `features` array embedded inside each specific product object in the `/api/offers/flights` response.
+
+If you are scraping or consuming this endpoint for your own tools, extract the `features` list directly from the product object (`cabins[CABIN].products[PRODUCT].features`).
+
+Key feature properties to extract:
+*   **`type`**: The standard identifier for the rule (e.g., `BAGGAGE`, `LOUNGE`, `FAST_TRACK`, `SEAT_SELECTION`, `REFUND`).
+*   **`included`**: A Boolean (`true`/`false`) dictating if the amenity is part of the ticket price without extra charge.
+*   **`description`**: The human-readable string rendered in the UI (e.g., *"1 checked bag (23kg)"*).
+
+**Note on Tier Status:** The API automatically adjusts the Boolean `included` flags (and sometimes the associated text) based on the EuroBonus tier associated with the active `session_id`. If logged in as a Gold/Diamond member, benefits like Lounge and Fast Track will reflect `included: true` even if the underlying base fare (e.g., Economy Go) would normally lack them.
 
 ---
 
