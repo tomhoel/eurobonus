@@ -403,13 +403,30 @@ The API is sensitive to high-frequency requests.
 *   **Batching**: If scanning a year, break it into small chunks.
 *   **Backoff**: If you receive HTTP 429 (Too Many Requests), pause for **>60 seconds** before retrying.
 
-### Cloudflare & Bot Detection
+### Cloudflare & Bot Detection Evasion
 
-SAS uses Cloudflare. If you encounter `403 Forbidden` or CAPTCHA challenges:
+SAS protects its endpoints—especially `/api/offers/flights`—with strict Cloudflare Turnstile and bot-detection heuristics. Standard scraping tools (e.g., `requests`, basic Puppeteer/Playwright) will almost always be met with a `403 Forbidden` or infinite CAPTCHA loops.
 
-1.  **Browser Headers**: Ensure `User-Agent` matches a real modern browser.
-2.  **Session Refresh**: You may need to refresh your session cookies by logging in again via a browser.
-3.  **Browser Automation**: For fully automated tools, use browser automation frameworks to acquire cookies before making API calls. Options exist across all major ecosystems (e.g., Selenium, browser automation libraries in Node.js, Python, Go, etc.).
+To consistently bypass this, our architecture leverages **undetected browser automation** specifically tuned to mimic human behavior and harvest necessary authentication tokens.
+
+#### 1. Under-the-Hood: How `nodriver` Bypasses Cloudflare
+The primary tool used for session capture is `nodriver` (an evolution of `undetected-chromedriver`). Key evasion strategies implemented in `capture_session.py`:
+
+*   **CDP Protocol Instead of WebDriver**: `nodriver` interacts directly with the Chrome DevTools Protocol (CDP), avoiding the `window.navigator.webdriver = true` flag that explicitly announces automation frameworks.
+*   **Headless Modes**: Running headless often triggers Cloudflare. If run headlessly (e.g., in Docker), specific arguments like `--disable-blink-features=AutomationControlled` must be injected.
+*   **Network Interception (CDP)**: Instead of scraping the DOM, the script uses CDP network monitoring (`cdp.network.RequestWillBeSent`) to passively intercept the `Authorization` bearer token as the React app makes underlying API calls to `/award-api/flights`.
+*   **Event Emulation**: Instead of instantly injecting text via DOM manipulation, the script falls back to slow, simulated keystrokes (`element_slow_type`) and CDP `insertText` tools.
+*   **Third-Party Cookie Flags**: Cloudflare often demands third-party cookie access. The script launches Chrome with `--disable-features=ThirdPartyCookieDeprecation,SameSiteByDefaultCookies` to ensure Cloudflare's invisible frames evaluate successfully.
+
+#### 2. The Multi-Layer Token Harvesting Strategy
+Because Auth0 tokens are hidden across different browser layers, `capture_session.py` attempts a waterfall approach to extract the necessary `Bearer` token to use for headless API calls later:
+
+1.  **CDP Inspection**: Listens to outbound network requests for the `Authorization` header.
+2.  **Storage Scanning**: Injecting JavaScript to parse `localStorage` and `sessionStorage` for keys matching `@@auth0`.
+3.  **IndexedDB Extraction**: Iterating through the browser's local databases for cached Auth0 session bodies.
+4.  **Fetch Interception**: Mutating the `window.fetch` prototype in the browser context to catch tokens bound to XHR requests.
+
+Once the `sas_session.json` (containing the cookies, token, and storage state) is generated, lightweight scripts (like `sas_search_api.py`) can inject these cookies into standard Python HTTP clients and achieve high-speed, headless API querying without triggering further Cloudflare blocks.
 
 ---
 
