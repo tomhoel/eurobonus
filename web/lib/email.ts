@@ -18,7 +18,7 @@ export async function sendAlertEmail(options: {
 
   const resend = getResend();
   await resend.emails.send({
-    from: "Award Finder <alerts@yourdomain.com>",
+    from: "hellasus.no <alerts@hellasus.no>",
     to: options.to,
     subject: `${options.cabinClass} bonus seats: ${options.originName} → ${options.destinationName}, ${options.date}`,
     html: `

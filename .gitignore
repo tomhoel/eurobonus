@@ -40,4 +40,5 @@ cookies.txt
 *.html
 *.webp
 *.png
+!web/public/*.png
 .superpowers/

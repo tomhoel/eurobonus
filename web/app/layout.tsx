@@ -7,8 +7,8 @@ import { Nav } from "@/components/nav";
 const inter = Inter({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "EuroBonus Award Finder",
-  description: "Find SAS EuroBonus bonus ticket availability",
+  title: "hellasus.no — SAS EuroBonus Award Search",
+  description: "Find SAS EuroBonus bonus ticket availability. Real-time search, smart alerts, best deals.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
