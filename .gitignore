@@ -1,11 +1,8 @@
 # Logs
 *.log
-monitor.log
-bot.log
 
 # Database
 *.db
-sas_monitor.db
 
 # Config with secrets
 config.json
@@ -38,6 +35,9 @@ cookies.txt
 # Data & Responses
 *.json
 !sas_route_map.json
-availability_alerts.txt
+!web/**/*.json
+!web/*.json
 *.html
 *.webp
+*.png
+.superpowers/
