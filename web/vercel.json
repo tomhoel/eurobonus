@@ -1,0 +1,7 @@
+{
+  "crons": [
+    { "path": "/api/cron/poll-availability", "schedule": "*/30 * * * *" },
+    { "path": "/api/cron/verify-bonus", "schedule": "0 */2 * * *" },
+    { "path": "/api/cron/refresh-session", "schedule": "0 */6 * * *" }
+  ]
+}
