@@ -1,313 +1,363 @@
 import Image from "next/image";
-import { SearchForm } from "@/components/search-form";
+import Link from "next/link";
+import { HoverCard, HoverRow } from "@/components/hover-card";
+
+const mono = "font-[family-name:var(--font-geist-mono)]";
 
 export default function Home() {
   return (
-    <div className="-mx-4 -mt-8">
-      {/* Hero */}
-      <section className="relative overflow-hidden bg-[#08090e] px-6 pb-24 pt-24">
-        {/* Aurora background effect */}
-        <div className="pointer-events-none absolute inset-0">
-          <div className="absolute -left-40 -top-40 h-[600px] w-[600px] rounded-full bg-indigo-600/15 blur-[120px]" />
-          <div className="absolute -right-20 top-20 h-[500px] w-[500px] rounded-full bg-violet-600/10 blur-[100px]" />
-          <div className="absolute bottom-0 left-1/3 h-[400px] w-[600px] rounded-full bg-blue-600/8 blur-[120px]" />
-          {/* Grid overlay */}
-          <div
-            className="absolute inset-0 opacity-[0.03]"
+    <>
+      {/* ═══ SECTION 1: HERO — centered headline + sub + 2 CTAs ═══ */}
+      <section className="relative overflow-hidden pb-16 pt-[min(18vh,160px)]">
+        {/* Gradient orb behind headline */}
+        <div className="pointer-events-none absolute left-1/2 top-0 h-[600px] w-[1000px] -translate-x-1/2">
+          <div className="h-full w-full rounded-full opacity-30 blur-[100px]" style={{ background: "conic-gradient(from 180deg at 50% 50%, #1e3a8a 0deg, #7c3aed 120deg, #2563eb 240deg, #1e3a8a 360deg)" }} />
+        </div>
+
+        <div className="relative mx-auto max-w-[1200px] px-6 text-center">
+          <h1
+            className="mx-auto max-w-[900px] font-bold"
             style={{
-              backgroundImage: `linear-gradient(rgba(255,255,255,0.1) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.1) 1px, transparent 1px)`,
-              backgroundSize: "60px 60px",
+              fontSize: "clamp(44px, 7.5vw, 80px)",
+              lineHeight: 1.05,
+              letterSpacing: "-0.04em",
+              background: "linear-gradient(180deg, #fff 30%, hsla(0,0%,100%,.38) 100%)",
+              WebkitBackgroundClip: "text",
+              WebkitTextFillColor: "transparent",
             }}
-          />
+          >
+            Find and book on the EuroBonus network.
+          </h1>
+
+          <p className="mx-auto mt-6 max-w-[600px] text-[18px] leading-[1.65] text-[hsla(0,0%,100%,.48)]">
+            hellasus.no scans the SAS booking engine every 30 minutes, verifies genuine bonus seats, and alerts you before they vanish.
+          </p>
+
+          <div className="mt-10 flex items-center justify-center gap-3">
+            <Link href="/search" className="inline-flex h-[44px] items-center gap-2 rounded-[8px] bg-white px-5 text-[14px] font-medium text-black transition hover:bg-white/90">
+              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" /></svg>
+              Start Searching
+            </Link>
+            <Link href="/deals" className="inline-flex h-[44px] items-center rounded-[8px] border border-[hsla(0,0%,100%,.14)] px-5 text-[14px] font-medium text-[hsla(0,0%,100%,.63)] transition hover:border-[hsla(0,0%,100%,.25)] hover:text-[hsla(0,0%,100%,.85)]">
+              View Deals
+            </Link>
+          </div>
         </div>
 
-        <div className="relative mx-auto max-w-5xl">
-          <div className="flex flex-col items-center text-center">
-            {/* Badge */}
-            <div className="mb-8 inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-1.5 backdrop-blur-sm">
-              <span className="relative flex h-2 w-2">
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
-                <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-400" />
-              </span>
-              <span className="text-xs font-medium tracking-wide text-white/60">Live tracking SAS &middot; SkyTeam &middot; 150+ routes</span>
+        {/* Hero visual — terminal window */}
+        <div className="relative mx-auto mt-16 max-w-[960px] px-6">
+          <div className="overflow-hidden rounded-xl border border-[hsla(0,0%,100%,.08)] shadow-[0_20px_60px_-15px_rgba(0,0,0,.6)]">
+            {/* Window chrome */}
+            <div className="flex items-center gap-2 border-b border-[hsla(0,0%,100%,.06)] bg-[hsla(0,0%,100%,.025)] px-4 py-[10px]">
+              <div className="flex gap-[6px]">
+                {[0, 1, 2].map((d) => <div key={d} className="h-[12px] w-[12px] rounded-full bg-[hsla(0,0%,100%,.07)]" />)}
+              </div>
+              <div className="ml-3 flex items-center gap-2">
+                <span className={`text-[12px] text-[hsla(0,0%,100%,.22)] ${mono}`}>live — bonus seat availability</span>
+              </div>
+              <div className="ml-auto flex items-center gap-[6px]">
+                <span className="h-[6px] w-[6px] rounded-full bg-emerald-500" />
+                <span className="text-[11px] text-[hsla(0,0%,100%,.18)]">updated 2 min ago</span>
+              </div>
+            </div>
+            {/* Table head */}
+            <div className={`flex items-center border-b border-[hsla(0,0%,100%,.06)] px-5 py-[10px] text-[11px] font-medium uppercase tracking-[0.08em] text-[hsla(0,0%,100%,.22)] ${mono}`}>
+              <span className="w-[160px]">Route</span>
+              <span className="w-[180px]">City pair</span>
+              <span className="flex-1">Date</span>
+              <span className="w-[90px] text-right">Economy</span>
+              <span className="w-[90px] text-right">Business</span>
+              <span className="w-[80px] text-right">Status</span>
+            </div>
+            {/* Rows */}
+            {[
+              { r: "OSL → BKK", c: "Oslo → Bangkok", d: "Mar 15", e: "30,000", b: "60,000", ok: true, s: 4 },
+              { r: "CPH → NRT", c: "Copenhagen → Tokyo", d: "Apr 03", e: "30,000", b: "60,000", ok: true, s: 2 },
+              { r: "ARN → SIN", c: "Stockholm → Singapore", d: "Mar 22", e: "30,000", b: "—", ok: false, s: 6 },
+              { r: "CDG → HND", c: "Paris → Haneda", d: "Apr 10", e: "—", b: "60,000", ok: true, s: 1 },
+              { r: "AMS → PEK", c: "Amsterdam → Beijing", d: "May 01", e: "30,000", b: "—", ok: false, s: 3 },
+              { r: "LHR → KIX", c: "London → Osaka", d: "Jun 14", e: "30,000", b: "60,000", ok: true, s: 3 },
+            ].map((r, i) => (
+              <HoverRow key={i}>
+                <span className={`w-[160px] font-medium text-[hsla(0,0%,100%,.75)] ${mono}`}>{r.r}</span>
+                <span className="w-[180px] text-[13px] text-[hsla(0,0%,100%,.25)]">{r.c}</span>
+                <span className="flex-1 text-[13px] text-[hsla(0,0%,100%,.25)]">{r.d}, 2026</span>
+                <span className={`w-[90px] text-right text-[13px] ${r.e !== "—" ? "text-[hsla(0,0%,100%,.45)]" : "text-[hsla(0,0%,100%,.12)]"} ${mono}`}>{r.e}</span>
+                <span className={`w-[90px] text-right text-[13px] ${r.ok ? "font-medium text-emerald-500" : "text-[hsla(0,0%,100%,.12)]"} ${mono}`}>{r.b}</span>
+                <span className="flex w-[80px] items-center justify-end gap-[5px] text-[11px]">
+                  {r.ok ? (
+                    <><span className="h-[5px] w-[5px] rounded-full bg-emerald-500" /><span className="text-emerald-500/70">{r.s}</span></>
+                  ) : (
+                    <span className="text-[hsla(0,0%,100%,.15)]">—</span>
+                  )}
+                </span>
+              </HoverRow>
+            ))}
+            <div className={`flex items-center justify-between border-t border-[hsla(0,0%,100%,.06)] bg-[hsla(0,0%,100%,.025)] px-5 py-[10px] text-[11px] text-[hsla(0,0%,100%,.15)] ${mono}`}>
+              <span>EuroBonus bonus fares · points only</span>
+              <span>hellasus.no</span>
+            </div>
+          </div>
+          {/* Bottom fade */}
+          <div className="pointer-events-none absolute -bottom-16 left-0 right-0 h-16 bg-gradient-to-b from-transparent to-black" />
+        </div>
+      </section>
+
+      {/* ═══ SECTION 2: SOCIAL PROOF — 3 metrics in a row ═══ */}
+      <section className="border-y border-[hsla(0,0%,100%,.06)]">
+        <div className="mx-auto grid max-w-[1200px] grid-cols-3 px-6">
+          {[
+            { metric: "5.8×", desc: "better point value vs revenue tickets" },
+            { metric: "30 min", desc: "scan interval across all routes" },
+            { metric: "150+", desc: "SkyTeam routes monitored live" },
+          ].map((item, i) => (
+            <div key={i} className={`py-10 text-center ${i > 0 ? "border-l border-[hsla(0,0%,100%,.06)]" : ""}`}>
+              <div className={`text-[28px] font-bold tracking-[-0.02em] ${mono}`}>{item.metric}</div>
+              <div className="mt-1 text-[13px] text-[hsla(0,0%,100%,.32)]">{item.desc}</div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* ═══ SECTION 3: "YOUR AWARD, VERIFIED" — 3 feature cards (dark bg) ═══ */}
+      <section className="px-6 py-[100px]">
+        <div className="mx-auto max-w-[1200px]">
+          <div className="mb-14 max-w-[500px]">
+            <p className="mb-3 text-[14px] font-medium text-blue-400">Your award, verified.</p>
+            <h2 className="text-[clamp(28px,3.5vw,44px)] font-bold leading-[1.1] tracking-[-0.035em]">
+              Real-time data, bonus detection, and alerts included.
+            </h2>
+          </div>
+
+          <div className="grid gap-4 lg:grid-cols-3">
+            {/* Card 1 — tall with code block */}
+            <div className="overflow-hidden rounded-xl border border-[hsla(0,0%,100%,.08)] bg-[hsla(0,0%,100%,.025)]">
+              <div className="p-7">
+                <h3 className="mb-2 text-[18px] font-semibold">Real-time engine</h3>
+                <p className="text-[14px] leading-[1.7] text-[hsla(0,0%,100%,.4)]">
+                  We query the SAS offers API — the same endpoint used by the booking page. Cached calendars miss seats and show phantoms.
+                </p>
+              </div>
+              <div className="border-t border-[hsla(0,0%,100%,.06)] bg-[hsla(0,0%,100%,.015)] p-5">
+                <pre className={`text-[12px] leading-[1.8] text-[hsla(0,0%,100%,.38)] ${mono}`}>
+{`GET /api/offers/flights
+  ?from=CPH&to=BKK
+  &outDate=20260315
+  &bookingFlow=points`}
+                </pre>
+              </div>
             </div>
 
-            {/* Headline */}
-            <h1 className="max-w-4xl text-5xl font-extrabold leading-[1.05] tracking-tight text-white sm:text-7xl">
-              Stop overpaying for
-              <span className="relative mx-2 inline-block">
-                <span className="relative z-10 bg-gradient-to-r from-indigo-400 via-violet-400 to-purple-400 bg-clip-text text-transparent"> award flights</span>
-              </span>
-            </h1>
+            {/* Card 2 */}
+            <div className="overflow-hidden rounded-xl border border-[hsla(0,0%,100%,.08)] bg-[hsla(0,0%,100%,.025)]">
+              <div className="p-7">
+                <h3 className="mb-2 text-[18px] font-semibold">Bonus detection</h3>
+                <p className="text-[14px] leading-[1.7] text-[hsla(0,0%,100%,.4)]">
+                  The calendar says &ldquo;5 Business seats.&rdquo; We tell you 3 are revenue at 414k pts and 2 are bonus at 60k pts. Only the bonus ones matter.
+                </p>
+              </div>
+              <div className="border-t border-[hsla(0,0%,100%,.06)] bg-[hsla(0,0%,100%,.015)] p-5">
+                <div className="flex items-center justify-between py-2 text-[13px]">
+                  <span className="text-[hsla(0,0%,100%,.3)]">Revenue</span>
+                  <span className={`text-[hsla(0,0%,100%,.2)] ${mono}`}>414,340 pts</span>
+                </div>
+                <div className="flex items-center justify-between border-t border-[hsla(0,0%,100%,.05)] py-2 text-[13px]">
+                  <span className="flex items-center gap-2 text-emerald-400">
+                    <span className="h-[5px] w-[5px] rounded-full bg-emerald-400" />
+                    Bonus
+                  </span>
+                  <span className={`font-medium text-emerald-400 ${mono}`}>60,000 pts</span>
+                </div>
+              </div>
+            </div>
 
-            <p className="mt-6 max-w-xl text-lg leading-relaxed text-white/40">
-              We verify every bonus seat in real-time against the SAS booking engine. The calendar lies — we don&apos;t.
+            {/* Card 3 */}
+            <div className="overflow-hidden rounded-xl border border-[hsla(0,0%,100%,.08)] bg-[hsla(0,0%,100%,.025)]">
+              <div className="p-7">
+                <h3 className="mb-2 text-[18px] font-semibold">Instant alerts</h3>
+                <p className="text-[14px] leading-[1.7] text-[hsla(0,0%,100%,.4)]">
+                  Subscribe to any route and cabin class. The second a bonus seat appears, you get an email with the exact point cost and a direct SAS booking link.
+                </p>
+              </div>
+              <div className="border-t border-[hsla(0,0%,100%,.06)] bg-[hsla(0,0%,100%,.015)] p-5">
+                <div className="rounded-lg border border-[hsla(0,0%,100%,.06)] bg-[hsla(0,0%,100%,.02)] p-4">
+                  <div className="mb-1 text-[11px] font-medium uppercase tracking-[0.08em] text-[hsla(0,0%,100%,.2)]">New alert</div>
+                  <div className="text-[14px] font-medium">Business seats: OSL → BKK</div>
+                  <div className="mt-1 text-[12px] text-[hsla(0,0%,100%,.3)]">4 bonus seats · 60,000 pts · Mar 15</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* ═══ SECTION 4: ADDITIONAL FEATURES — 2×2 grid ═══ */}
+      <section className="border-t border-[hsla(0,0%,100%,.06)] px-6 py-[100px]">
+        <div className="mx-auto max-w-[1200px]">
+          <div className="grid gap-4 sm:grid-cols-2">
+            <HoverCard>
+              <h3 className="mb-2 text-[18px] font-semibold">SkyTeam network</h3>
+              <p className="mb-6 text-[14px] leading-[1.7] text-[hsla(0,0%,100%,.4)]">
+                Search partner awards on Air France, KLM, Delta, Korean Air — connections SAS doesn&apos;t surface in their own calendar.
+              </p>
+              <div className="flex flex-wrap gap-[6px]">
+                {["SK", "AF", "KL", "DL", "KE", "MU", "VN", "GA", "CI", "SU"].map((c) => (
+                  <span key={c} className={`rounded border border-[hsla(0,0%,100%,.06)] bg-[hsla(0,0%,100%,.03)] px-[10px] py-[4px] text-[12px] text-[hsla(0,0%,100%,.3)] ${mono}`}>{c}</span>
+                ))}
+              </div>
+            </HoverCard>
+            <HoverCard>
+              <h3 className="mb-2 text-[18px] font-semibold">150+ destinations</h3>
+              <p className="mb-6 text-[14px] leading-[1.7] text-[hsla(0,0%,100%,.4)]">
+                The full SAS award route network mapped. Oslo, Copenhagen, Stockholm, Paris, Amsterdam — to Bangkok, Tokyo, Singapore, New York.
+              </p>
+              <div className="flex flex-wrap gap-[6px]">
+                {["OSL", "CPH", "ARN", "CDG", "AMS", "→", "BKK", "NRT", "SIN", "JFK", "HND", "KIX"].map((c, i) => (
+                  <span key={i} className={`${c === "→" ? "text-[hsla(0,0%,100%,.15)]" : `rounded border border-[hsla(0,0%,100%,.06)] bg-[hsla(0,0%,100%,.03)] px-[10px] py-[4px] text-[hsla(0,0%,100%,.3)]`} text-[12px] ${mono}`}>{c}</span>
+                ))}
+              </div>
+            </HoverCard>
+          </div>
+        </div>
+      </section>
+
+      {/* ═══ SECTION 5: HOW IT WORKS — full-width dark band ═══ */}
+      <section className="border-y border-[hsla(0,0%,100%,.06)] bg-[hsla(0,0%,100%,.015)] px-6 py-[100px]">
+        <div className="mx-auto max-w-[1200px]">
+          <div className="mb-14 text-center">
+            <p className="mb-3 text-[14px] font-medium text-blue-400">How it works</p>
+            <h2 className="text-[clamp(28px,3.5vw,44px)] font-bold leading-[1.1] tracking-[-0.035em]">
+              Search. Watch. Book.
+            </h2>
+          </div>
+
+          <div className="mx-auto grid max-w-[900px] gap-0 overflow-hidden rounded-xl border border-[hsla(0,0%,100%,.08)] sm:grid-cols-3">
+            {[
+              { n: "01", t: "Search", d: "Pick a route. We query the booking engine — real-time availability, not the stale daily calendar cache." },
+              { n: "02", t: "Watch", d: "Subscribe to routes. We scan every 30 min and email you the instant genuine bonus seats appear." },
+              { n: "03", t: "Book", d: "Click through to SAS with your flight pre-selected. Economy from 5k, business from 20k–60k points depending on route." },
+            ].map((s, i) => (
+              <div key={s.n} className={`bg-[hsla(0,0%,100%,.02)] p-8 ${i > 0 ? "border-l border-[hsla(0,0%,100%,.06)]" : ""}`}>
+                <span className={`text-[11px] font-medium text-[hsla(0,0%,100%,.2)] ${mono}`}>{s.n}</span>
+                <h3 className="mt-3 text-[18px] font-semibold">{s.t}</h3>
+                <p className="mt-3 text-[14px] leading-[1.7] text-[hsla(0,0%,100%,.38)]">{s.d}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* ═══ SECTION 6: PRICING COMPARISON — side by side ═══ */}
+      <section className="px-6 py-[100px]">
+        <div className="mx-auto max-w-[1200px]">
+          <div className="mb-14 text-center">
+            <h2 className="text-[clamp(28px,3.5vw,44px)] font-bold leading-[1.1] tracking-[-0.035em]">
+              Same flight. <span className="text-[hsla(0,0%,100%,.3)]">Different price.</span>
+            </h2>
+            <p className="mt-4 text-[16px] text-[hsla(0,0%,100%,.4)]">
+              CPH → Bangkok, Business class. The calendar shows both as &ldquo;available.&rdquo;
             </p>
+          </div>
 
-            {/* CTA Row */}
-            <div className="mt-10 flex flex-col items-center gap-4 sm:flex-row">
-              <a
-                href="/search"
-                className="group relative inline-flex items-center gap-2 overflow-hidden rounded-xl bg-indigo-600 px-8 py-4 font-semibold text-white shadow-2xl shadow-indigo-600/20 transition-all hover:shadow-indigo-600/40"
-              >
-                <span className="absolute inset-0 bg-gradient-to-r from-indigo-500 to-violet-600 opacity-0 transition-opacity group-hover:opacity-100" />
-                <svg className="relative h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" />
-                </svg>
-                <span className="relative">Search availability</span>
-              </a>
-              <a href="/deals" className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-8 py-4 font-medium text-white/60 backdrop-blur-sm transition-all hover:border-white/20 hover:text-white/80">
-                Browse deals
-                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path d="M5 12h14M12 5l7 7-7 7" />
-                </svg>
-              </a>
+          <div className="mx-auto grid max-w-[640px] gap-4 sm:grid-cols-2">
+            <div className="rounded-xl border border-[hsla(0,0%,100%,.06)] bg-[hsla(0,0%,100%,.02)] p-8">
+              <div className="mb-1 text-[11px] font-medium uppercase tracking-[0.08em] text-[hsla(0,0%,100%,.22)]">Revenue ticket</div>
+              <div className={`mt-3 text-[40px] font-bold tracking-[-0.03em] text-[hsla(0,0%,100%,.18)] ${mono}`}>414,340</div>
+              <div className="text-[13px] text-[hsla(0,0%,100%,.18)]">pts</div>
+              <div className="mt-6 space-y-[10px] border-t border-[hsla(0,0%,100%,.05)] pt-5 text-[13px]">
+                <div className="flex justify-between"><span className="text-[hsla(0,0%,100%,.22)]">Cash price</span><span className="text-[hsla(0,0%,100%,.3)]">19,067 NOK</span></div>
+                <div className="flex justify-between"><span className="text-[hsla(0,0%,100%,.22)]">Per point</span><span className={`text-[hsla(0,0%,100%,.22)] ${mono}`}>0.046 NOK</span></div>
+              </div>
+            </div>
+            <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/[0.03] p-8">
+              <div className="mb-1 text-[11px] font-medium uppercase tracking-[0.08em] text-emerald-400">Bonus ticket ✓</div>
+              <div className={`mt-3 text-[40px] font-bold tracking-[-0.03em] text-white ${mono}`}>60,000</div>
+              <div className="text-[13px] text-emerald-400/50">pts</div>
+              <div className="mt-6 space-y-[10px] border-t border-emerald-500/10 pt-5 text-[13px]">
+                <div className="flex justify-between"><span className="text-[hsla(0,0%,100%,.22)]">Cabin</span><span className="text-[hsla(0,0%,100%,.5)]">Business</span></div>
+                <div className="flex justify-between"><span className="text-[hsla(0,0%,100%,.22)]">Per point</span><span className={`text-emerald-400 ${mono}`}>0.32 NOK</span></div>
+              </div>
             </div>
           </div>
+        </div>
+      </section>
 
-          {/* Search Card — floating glass */}
-          <div className="mx-auto mt-16 max-w-3xl rounded-2xl border border-white/10 bg-white/[0.04] p-5 shadow-2xl shadow-black/20 backdrop-blur-xl">
-            <SearchForm />
+      {/* ═══ SECTION 7: "DEPLOY" CTA — centered like Vercel ═══ */}
+      <section className="relative overflow-hidden border-t border-[hsla(0,0%,100%,.06)] px-6 py-[120px]">
+        <div className="pointer-events-none absolute left-1/2 top-1/2 h-[400px] w-[700px] -translate-x-1/2 -translate-y-1/2 rounded-full blur-[120px]" style={{ background: "radial-gradient(circle, hsla(217,91%,60%,.1) 0%, transparent 70%)" }} />
+        <div className="relative mx-auto max-w-[560px] text-center">
+          <h2 className="text-[clamp(32px,4.5vw,52px)] font-bold leading-[1.08] tracking-[-0.04em]">
+            Start searching in seconds.
+          </h2>
+          <p className="mt-5 text-[16px] leading-[1.6] text-[hsla(0,0%,100%,.4)]">
+            Set an alert, close the tab. We&apos;ll email you when seats open.
+          </p>
+          <div className="mt-10 flex items-center justify-center gap-3">
+            <a href="/search" className="inline-flex h-[44px] items-center rounded-[8px] bg-white px-6 text-[14px] font-medium text-black transition hover:bg-white/90">
+              Start Searching
+            </a>
           </div>
+          <p className="mt-5 text-[13px] text-[hsla(0,0%,100%,.18)]">Free forever · No credit card</p>
+        </div>
+      </section>
 
-          {/* Stats Row */}
-          <div className="mx-auto mt-16 grid max-w-3xl grid-cols-2 gap-4 sm:grid-cols-4">
+      {/* ═══ SECTION 8: SECONDARY CTAs — 2 wide buttons like Vercel ═══ */}
+      <section className="border-t border-[hsla(0,0%,100%,.06)] px-6 py-10">
+        <div className="mx-auto grid max-w-[900px] gap-4 sm:grid-cols-2">
+          <Link href="/deals" className="group flex items-center justify-between rounded-xl border border-[hsla(0,0%,100%,.08)] bg-[hsla(0,0%,100%,.02)] p-6 transition-colors hover:border-[hsla(0,0%,100%,.16)]">
+            <div>
+              <div className="text-[16px] font-semibold">Browse live deals</div>
+              <div className="mt-1 text-[13px] text-[hsla(0,0%,100%,.35)]">See the best bonus availability right now</div>
+            </div>
+            <svg className="h-5 w-5 text-[hsla(0,0%,100%,.25)] transition group-hover:translate-x-1 group-hover:text-[hsla(0,0%,100%,.5)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path d="M5 12h14M12 5l7 7-7 7" /></svg>
+          </Link>
+          <Link href="/alerts" className="group flex items-center justify-between rounded-xl border border-[hsla(0,0%,100%,.08)] bg-[hsla(0,0%,100%,.02)] p-6 transition-colors hover:border-[hsla(0,0%,100%,.16)]">
+            <div>
+              <div className="text-[16px] font-semibold">Set up alerts</div>
+              <div className="mt-1 text-[13px] text-[hsla(0,0%,100%,.35)]">Get emailed when bonus seats appear</div>
+            </div>
+            <svg className="h-5 w-5 text-[hsla(0,0%,100%,.25)] transition group-hover:translate-x-1 group-hover:text-[hsla(0,0%,100%,.5)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path d="M5 12h14M12 5l7 7-7 7" /></svg>
+          </Link>
+        </div>
+      </section>
+
+      {/* ═══ FOOTER — multi-column like Vercel ═══ */}
+      <footer className="border-t border-[hsla(0,0%,100%,.06)] px-6 pb-10 pt-14">
+        <div className="mx-auto max-w-[1200px]">
+          <div className="grid grid-cols-2 gap-8 sm:grid-cols-4 lg:grid-cols-5">
+            {/* Brand col */}
+            <div className="col-span-2 sm:col-span-1">
+              <Image src="/sus-white.png" alt="SUS" width={94} height={36} className="mb-4 h-[31px] w-auto opacity-70" />
+              <p className="text-[13px] text-[hsla(0,0%,100%,.2)]">Award search &amp; alerts<br />for SAS EuroBonus</p>
+            </div>
+            {/* Link columns */}
             {[
-              { value: "150+", label: "Routes tracked" },
-              { value: "30min", label: "Scan interval" },
-              { value: "Real-time", label: "Bonus verification" },
-              { value: "Free", label: "Always" },
-            ].map((stat) => (
-              <div key={stat.label} className="rounded-xl border border-white/5 bg-white/[0.02] px-4 py-5 text-center">
-                <div className="text-2xl font-bold tracking-tight text-white">{stat.value}</div>
-                <div className="mt-1 text-xs text-white/30">{stat.label}</div>
+              { title: "Product", links: ["Search Flights", "Browse Deals", "Set Alerts", "Notifications"] },
+              { title: "Resources", links: ["API Documentation", "SAS EuroBonus", "SkyTeam Partners", "Route Map"] },
+              { title: "Routes", links: ["OSL → BKK", "CPH → NRT", "ARN → SIN", "CDG → HND"] },
+              { title: "Company", links: ["hellasus.no", "GitHub", "Contact"] },
+            ].map((col) => (
+              <div key={col.title}>
+                <h4 className="mb-4 text-[13px] font-medium text-[hsla(0,0%,100%,.4)]">{col.title}</h4>
+                <ul className="space-y-[10px]">
+                  {col.links.map((link) => (
+                    <li key={link}><span className="cursor-pointer text-[13px] text-[hsla(0,0%,100%,.22)] transition hover:text-[hsla(0,0%,100%,.5)]">{link}</span></li>
+                  ))}
+                </ul>
               </div>
             ))}
           </div>
-        </div>
-      </section>
 
-      {/* Problem → Solution */}
-      <section className="relative bg-[#08090e] px-6 py-24">
-        <div className="pointer-events-none absolute inset-0">
-          <div className="absolute left-1/2 top-0 h-px w-2/3 -translate-x-1/2 bg-gradient-to-r from-transparent via-white/10 to-transparent" />
-        </div>
-
-        <div className="relative mx-auto max-w-5xl">
-          <div className="mb-16 text-center">
-            <p className="text-xs font-semibold uppercase tracking-[0.25em] text-indigo-400">The problem</p>
-            <h2 className="mt-4 text-3xl font-bold tracking-tight text-white sm:text-4xl">
-              SAS calendars are lying to you
-            </h2>
-          </div>
-
-          <div className="grid gap-6 sm:grid-cols-2">
-            {/* Before */}
-            <div className="rounded-2xl border border-red-500/20 bg-red-500/[0.03] p-8">
-              <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-red-500/20 bg-red-500/10 px-3 py-1">
-                <span className="h-1.5 w-1.5 rounded-full bg-red-400" />
-                <span className="text-xs font-semibold text-red-400">Without hellasus.no</span>
-              </div>
-              <ul className="space-y-4">
-                {[
-                  "Calendar shows 5 Business seats — they're all revenue tickets at 414,000 pts",
-                  "Data updates once per day — real seats vanish within hours",
-                  "No way to know if seats are bonus or cash-converted",
-                  "Manually checking routes every day hoping to get lucky",
-                ].map((item) => (
-                  <li key={item} className="flex gap-3 text-sm leading-relaxed text-white/50">
-                    <svg className="mt-0.5 h-4 w-4 shrink-0 text-red-400/60" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                      <path d="M6 18L18 6M6 6l12 12" />
-                    </svg>
-                    {item}
-                  </li>
-                ))}
-              </ul>
+          {/* Bottom bar */}
+          <div className="mt-14 flex items-center justify-between border-t border-[hsla(0,0%,100%,.06)] pt-6">
+            <span className="text-[12px] text-[hsla(0,0%,100%,.15)]">&copy; 2026 hellasus.no</span>
+            <div className="flex items-center gap-[6px] text-[12px] text-[hsla(0,0%,100%,.15)]">
+              <span className="h-[6px] w-[6px] rounded-full bg-emerald-500" />
+              All systems operational
             </div>
-
-            {/* After */}
-            <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/[0.03] p-8">
-              <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1">
-                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-                <span className="text-xs font-semibold text-emerald-400">With hellasus.no</span>
-              </div>
-              <ul className="space-y-4">
-                {[
-                  "We verify against the booking engine — only real bonus seats shown",
-                  "Scans every 30 minutes, alerts you instantly via email",
-                  "Clear bonus vs revenue labels with exact points cost",
-                  "Set it and forget it — we watch, you book",
-                ].map((item) => (
-                  <li key={item} className="flex gap-3 text-sm leading-relaxed text-white/50">
-                    <svg className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400/60" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                      <path d="M5 12l5 5L20 7" />
-                    </svg>
-                    {item}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* How it works */}
-      <section className="relative bg-[#08090e] px-6 py-24">
-        <div className="pointer-events-none absolute inset-0">
-          <div className="absolute left-1/2 top-0 h-px w-2/3 -translate-x-1/2 bg-gradient-to-r from-transparent via-white/10 to-transparent" />
-        </div>
-
-        <div className="relative mx-auto max-w-5xl">
-          <div className="mb-16 text-center">
-            <p className="text-xs font-semibold uppercase tracking-[0.25em] text-indigo-400">How it works</p>
-            <h2 className="mt-4 text-3xl font-bold tracking-tight text-white sm:text-4xl">
-              Three steps to the best seats
-            </h2>
-          </div>
-
-          <div className="grid gap-1 sm:grid-cols-3">
-            {[
-              {
-                step: "01",
-                title: "Search",
-                desc: "Pick your route and month. We query the SAS booking engine in real-time — not the stale daily cache.",
-                icon: (
-                  <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                    <circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" />
-                  </svg>
-                ),
-              },
-              {
-                step: "02",
-                title: "Watch",
-                desc: "Set alerts on routes you care about. We scan every 30 minutes and email you the instant bonus seats appear.",
-                icon: (
-                  <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                    <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 0 1-3.46 0" />
-                  </svg>
-                ),
-              },
-              {
-                step: "03",
-                title: "Book",
-                desc: "Click straight through to SAS with your flight pre-selected. Grab those 30,000-point business seats.",
-                icon: (
-                  <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                    <path d="M15 5v2m0 4v2m0 4v2M5 5a2 2 0 0 0-2 2v3a2 2 0 1 1 0 4v3a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-3a2 2 0 1 1 0-4V7a2 2 0 0 0-2-2H5z" />
-                  </svg>
-                ),
-              },
-            ].map((item) => (
-              <div key={item.step} className="group rounded-2xl border border-white/5 bg-white/[0.02] p-8 transition-all hover:border-white/10 hover:bg-white/[0.04]">
-                <div className="mb-6 flex items-center justify-between">
-                  <span className="text-3xl font-black tracking-tighter text-white/10">{item.step}</span>
-                  <div className="flex h-10 w-10 items-center justify-center rounded-xl border border-white/10 bg-white/5 text-indigo-400 transition-colors group-hover:border-indigo-500/30 group-hover:bg-indigo-500/10">
-                    {item.icon}
-                  </div>
-                </div>
-                <h3 className="mb-2 text-xl font-bold text-white">{item.title}</h3>
-                <p className="text-sm leading-relaxed text-white/40">{item.desc}</p>
-              </div>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      {/* Value comparison — the knockout section */}
-      <section className="relative bg-[#08090e] px-6 py-24">
-        <div className="pointer-events-none absolute inset-0">
-          <div className="absolute left-1/2 top-0 h-px w-2/3 -translate-x-1/2 bg-gradient-to-r from-transparent via-white/10 to-transparent" />
-        </div>
-
-        <div className="relative mx-auto max-w-3xl text-center">
-          <p className="text-xs font-semibold uppercase tracking-[0.25em] text-indigo-400">Real example</p>
-          <h2 className="mt-4 text-3xl font-bold tracking-tight text-white sm:text-4xl">
-            Copenhagen &rarr; Bangkok
-          </h2>
-          <p className="mt-3 text-white/40">Same flight. Wildly different prices.</p>
-
-          <div className="mt-12 grid gap-4 sm:grid-cols-2">
-            <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-8">
-              <div className="text-xs font-semibold uppercase tracking-widest text-white/30">Revenue ticket</div>
-              <div className="mt-4 text-5xl font-black tracking-tight text-white/20">414,340</div>
-              <div className="mt-1 text-sm text-white/30">points</div>
-              <div className="mt-4 text-xs text-white/20">= 19,067 NOK cash value</div>
-              <div className="mt-2 text-xs text-red-400/60">0.046 NOK per point</div>
-            </div>
-            <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/[0.04] p-8 ring-1 ring-emerald-500/10">
-              <div className="text-xs font-semibold uppercase tracking-widest text-emerald-400">Bonus ticket</div>
-              <div className="mt-4 text-5xl font-black tracking-tight text-white">108,000</div>
-              <div className="mt-1 text-sm text-emerald-400/60">points</div>
-              <div className="mt-4 text-xs text-white/40">Business class one-way</div>
-              <div className="mt-2 text-xs text-emerald-400">We find these for you</div>
-            </div>
-          </div>
-
-          <p className="mt-8 text-sm text-white/30">
-            The calendar showed both as &ldquo;available.&rdquo; Only one is worth booking.
-          </p>
-        </div>
-      </section>
-
-      {/* Final CTA */}
-      <section className="relative overflow-hidden bg-[#08090e] px-6 py-32">
-        <div className="pointer-events-none absolute inset-0">
-          <div className="absolute left-1/2 top-1/2 h-[500px] w-[800px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-indigo-600/10 blur-[120px]" />
-        </div>
-
-        <div className="relative mx-auto max-w-xl text-center">
-          <h2 className="text-4xl font-extrabold tracking-tight text-white sm:text-5xl">
-            Your next trip is<br />
-            <span className="bg-gradient-to-r from-indigo-400 to-violet-400 bg-clip-text text-transparent">waiting</span>
-          </h2>
-          <p className="mt-6 text-lg text-white/40">
-            Sign in, set an alert, go live your life. We&apos;ll ping you when the seats open.
-          </p>
-          <div className="mt-10 flex flex-col items-center justify-center gap-4 sm:flex-row">
-            <a
-              href="/api/auth/signin"
-              className="group relative inline-flex items-center gap-2 overflow-hidden rounded-xl bg-white px-8 py-4 font-semibold text-gray-900 transition-all hover:shadow-xl hover:shadow-white/10"
-            >
-              Sign in with Google
-            </a>
-            <a href="/search" className="text-sm text-white/40 underline decoration-white/10 underline-offset-4 transition hover:text-white/60 hover:decoration-white/30">
-              or search without an account
-            </a>
-          </div>
-        </div>
-      </section>
-
-      {/* Footer */}
-      <footer className="border-t border-white/5 bg-[#08090e] px-6 py-12">
-        <div className="mx-auto max-w-5xl">
-          <div className="flex flex-col justify-between gap-10 sm:flex-row">
-            <div className="space-y-3">
-              <Image src="/sus.png" alt="SUS" width={80} height={32} className="h-8 w-auto rounded bg-white/90 px-1" />
-              <p className="text-sm text-white/20">Award search & alerts for SAS EuroBonus</p>
-            </div>
-            <div className="flex gap-12 text-sm">
-              <div className="space-y-3">
-                <h4 className="text-xs font-semibold uppercase tracking-widest text-white/20">Product</h4>
-                <div className="space-y-2 text-white/30">
-                  <p><a href="/search" className="transition hover:text-white/60">Search</a></p>
-                  <p><a href="/deals" className="transition hover:text-white/60">Deals</a></p>
-                  <p><a href="/alerts" className="transition hover:text-white/60">Alerts</a></p>
-                </div>
-              </div>
-              <div className="space-y-3">
-                <h4 className="text-xs font-semibold uppercase tracking-widest text-white/20">Info</h4>
-                <div className="space-y-2 text-white/30">
-                  <p>SAS EuroBonus</p>
-                  <p>SkyTeam Partners</p>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div className="mt-12 border-t border-white/5 pt-6">
-            <p className="text-xs text-white/15">&copy; 2026 hellasus.no &mdash; Not affiliated with SAS or SkyTeam.</p>
           </div>
         </div>
       </footer>
-    </div>
+    </>
   );
 }
