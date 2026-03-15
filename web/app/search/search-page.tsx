@@ -12,6 +12,7 @@ import { ResultCalendar } from "@/components/search/result-calendar";
 import { ResultMap } from "@/components/search/result-map";
 import { AIPanel } from "@/components/search/ai-panel";
 import { SearchSkeleton } from "@/components/search/search-skeleton";
+import { RouteDiscovery } from "@/components/search/route-discovery";
 import type { SearchFilters } from "@/lib/search/types";
 
 const mono = "font-[family-name:var(--font-geist-mono)]";
@@ -34,9 +35,17 @@ export function SearchPage() {
   } = useSearch();
 
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [discoveryDismissed, setDiscoveryDismissed] = useState(false);
+
+  const showDiscovery = !!filters.origin && !filters.destination && !discoveryDismissed;
 
   const handleApplyPartialFilters = (partial: Partial<SearchFilters>) => {
     setFilters({ ...filters, ...partial });
+  };
+
+  const handleSelectDiscoveryDest = (code: string) => {
+    updateFilter("destination", code);
+    setDiscoveryDismissed(true);
   };
 
   const hasRoute = filters.origin && filters.destination;
@@ -112,6 +121,17 @@ export function SearchPage() {
             />
           </div>
         </div>
+
+        {/* Route discovery panel */}
+        {showDiscovery && (
+          <div className="mt-4">
+            <RouteDiscovery
+              origin={filters.origin}
+              onSelectDestination={handleSelectDiscoveryDest}
+              onClose={() => setDiscoveryDismissed(true)}
+            />
+          </div>
+        )}
 
         {/* Filter chips */}
         <div className="mt-4">
@@ -189,8 +209,8 @@ export function SearchPage() {
           </div>
         )}
 
-        {/* Empty state */}
-        {!hasRoute && (
+        {/* Empty state — only if no origin selected */}
+        {!filters.origin && (
           <div className="mt-20 text-center">
             <div
               className="mx-auto text-[clamp(24px,3vw,32px)] font-bold tracking-[-0.03em]"
