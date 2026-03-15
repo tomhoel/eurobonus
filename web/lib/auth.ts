@@ -3,8 +3,10 @@ import Google from "next-auth/providers/google";
 import { DrizzleAdapter } from "@auth/drizzle-adapter";
 import { db } from "./db";
 
+const hasDB = !!process.env.DATABASE_URL;
+
 export const { handlers, auth, signIn, signOut } = NextAuth({
-  adapter: DrizzleAdapter(db),
+  ...(hasDB ? { adapter: DrizzleAdapter(db) } : {}),
   providers: [
     Google({
       clientId: process.env.AUTH_GOOGLE_ID!,
@@ -13,7 +15,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
   ],
   callbacks: {
     session({ session, user }) {
-      if (session.user) session.user.id = user.id;
+      if (session.user && user) session.user.id = user.id;
       return session;
     },
   },

@@ -22,6 +22,9 @@ export async function getOffersWithPoints(
     to: destination,
     outDate,
     adt: adults,
+    chd: 0,
+    inf: 0,
+    yth: 0,
     bookingFlow,
     pos: clientOpts.pos ?? "no",
     channel: "web",
@@ -75,16 +78,24 @@ function parseOffers(data: unknown, origin: string, destination: string, date: s
         durMins = Number(durRaw ?? 0);
       }
 
+      // Extract time/date from various SAS API response formats
+      const depDT = String(s.departureDateTimeInLocal ?? s.departureDateTime ?? "");
+      const arrDT = String(s.arrivalDateTimeInLocal ?? s.arrivalDateTime ?? "");
+      const depTime = s.departureTime ?? (depDT ? depDT.slice(11, 16) : "");
+      const arrTime = s.arrivalTime ?? (arrDT ? arrDT.slice(11, 16) : "");
+      const depDate = s.departureDate ?? (depDT ? depDT.slice(0, 10) : normalDate);
+      const arrDate = s.arrivalDate ?? (arrDT ? arrDT.slice(0, 10) : normalDate);
+
       return {
         flightNumber: String(s.flightNumber ?? ""),
-        carrier: String(carrier ?? ""),
+        carrier: String(carrier ?? mc.code ?? ""),
         carrierName: String(mc.name ?? ""),
         departureAirport: String(depAir ?? ""),
         arrivalAirport: String(arrAir ?? ""),
-        departureTime: String(s.departureTime ?? ""),
-        arrivalTime: String(s.arrivalTime ?? ""),
-        departureDate: String(s.departureDate ?? normalDate),
-        arrivalDate: String(s.arrivalDate ?? normalDate),
+        departureTime: String(depTime),
+        arrivalTime: String(arrTime),
+        departureDate: String(depDate),
+        arrivalDate: String(arrDate),
         aircraft: String(ac ?? ""),
         durationMinutes: durMins,
       };

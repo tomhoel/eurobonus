@@ -23,6 +23,7 @@ export async function GET(req: NextRequest) {
   }
 
   // Otherwise return calendar availability
-  const dates = await getAvailableDates(origin, destination, { month });
+  const cabin = searchParams.get("cabin") ?? "";
+  const dates = await getAvailableDates(origin, destination, { month, cabinClass: cabin });
   return NextResponse.json({ dates });
 }
